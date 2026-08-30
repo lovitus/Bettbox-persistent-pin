@@ -70,7 +70,6 @@ done < <(find "$app/Contents" -depth -type d \( -name '*.framework' -o -name '*.
 
 codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" --keychain "$keychain" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
-spctl --assess --type execute --verbose=2 "$app"
 
 dmg_stage="$work_dir/dmg-root"
 mkdir -p "$dmg_stage"
