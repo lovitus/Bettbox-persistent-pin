@@ -69,3 +69,58 @@ if [[ -n "$unformatted" ]]; then
   printf '%s\n' "$unformatted" >&2
   exit 1
 fi
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+workflow = Path(".github/workflows/build.yaml")
+if not workflow.is_file():
+    raise SystemExit("upstream build workflow is missing")
+
+text = workflow.read_text(encoding="utf-8")
+marker = "      matrix:\n        include:\n"
+try:
+    start = text.index(marker) + len(marker)
+    end = text.index("\n    steps:", start)
+except ValueError as exc:
+    raise SystemExit("could not locate the upstream build matrix") from exc
+
+entries = []
+current = None
+for line in text[start:end].splitlines():
+    match = re.match(r"\s+- platform:\s*(\S+)\s*$", line)
+    if match:
+        if current:
+            entries.append(current)
+        current = {"platform": match.group(1)}
+        continue
+    match = re.match(r"\s+(os|arch|compatible):\s*(\S+)\s*$", line)
+    if match and current is not None:
+        key, value = match.groups()
+        current[key] = value == "true" if key == "compatible" else value
+if current:
+    entries.append(current)
+
+expected = [
+    {"platform": "android", "os": "ubuntu-24.04", "arch": "arm64"},
+    {"platform": "android", "os": "ubuntu-24.04", "arch": "amd64"},
+    {"platform": "android", "os": "ubuntu-24.04", "arch": "arm"},
+    {"platform": "android", "os": "ubuntu-24.04", "arch": "universal"},
+    {"platform": "windows", "os": "windows-2022", "arch": "amd64"},
+    {"platform": "windows", "os": "windows-11-arm", "arch": "arm64"},
+    {"platform": "windows", "os": "windows-2022", "arch": "amd64", "compatible": True},
+    {"platform": "macos", "os": "macos-15", "arch": "arm64"},
+    {"platform": "macos", "os": "macos-15", "arch": "amd64"},
+    {"platform": "macos", "os": "macos-15", "arch": "amd64", "compatible": True},
+    {"platform": "linux", "os": "ubuntu-22.04", "arch": "amd64"},
+    {"platform": "linux", "os": "ubuntu-24.04-arm", "arch": "arm64"},
+    {"platform": "linux", "os": "ubuntu-22.04", "arch": "amd64", "compatible": True},
+]
+
+if entries != expected:
+    raise SystemExit(
+        "upstream build matrix changed; update and review this builder before publishing\n"
+        f"expected={expected!r}\nactual={entries!r}"
+    )
+PY

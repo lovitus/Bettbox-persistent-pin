@@ -36,7 +36,7 @@ https://github.com/lovitus/Bettbox-persistent-pin
 7. 只有全部矩阵和签名任务成功后才创建同版号 Release。
 8. 发布 SHA256SUMS、SOURCE_PROVENANCE.json 和 patched source archive。
 
-如果未来上游改动导致补丁冲突、任一平台失败或 Apple 公证失败，工作流不会发布残缺 Release，而会创建或更新一个自动化故障 Issue。
+如果未来上游改动导致补丁冲突、上游矩阵与本仓库经过审核的矩阵不一致、任一平台失败或 Apple 公证失败，工作流不会发布残缺 Release，而会创建或更新一个自动化故障 Issue。矩阵变化必须先同步审核，避免新平台被静默漏构建。
 
 ## 完整构建矩阵
 
