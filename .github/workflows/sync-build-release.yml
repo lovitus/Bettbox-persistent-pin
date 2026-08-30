@@ -637,9 +637,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          issue="$(gh issue list --state open --json number,title --jq '.[] | select(.title == "[automation] Bettbox persistent-pin build failed") | .number' | head -n 1)"
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json number,title --jq '.[] | select(.title == "[automation] Bettbox persistent-pin build failed") | .number' | head -n 1)"
           if [[ -n "$issue" ]]; then
-            gh issue close "$issue" --comment "Recovered in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --comment "Recovered in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
           fi
 
   report-failure:
@@ -690,9 +690,9 @@ jobs:
           No partial GitHub Release was published. Resolve the failed job and run the workflow manually with force_rebuild enabled.
           EOF
           )"
-          issue="$(gh issue list --state open --json number,title --jq '.[] | select(.title == "[automation] Bettbox persistent-pin build failed") | .number' | head -n 1)"
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json number,title --jq '.[] | select(.title == "[automation] Bettbox persistent-pin build failed") | .number' | head -n 1)"
           if [[ -n "$issue" ]]; then
-            gh issue comment "$issue" --body "$body"
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
           else
-            gh issue create --title "$title" --body "$body"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi
