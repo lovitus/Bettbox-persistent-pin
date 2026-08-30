@@ -1,0 +1,12 @@
+.DS_Store
+*.jks
+*.keystore
+*.p8
+*.p12
+*.pem
+*.key
+*.mobileprovision
+dist/
+source/
+*.tgz
+*.tar.gz

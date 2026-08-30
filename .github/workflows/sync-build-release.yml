@@ -1,0 +1,698 @@
+name: Sync, patch, build, sign, and release
+
+on:
+  schedule:
+    - cron: '17 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild and replace assets even when this upstream tag already has a release
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: bettbox-persistent-pin-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
+  SENTRY_BACKEND: none
+
+jobs:
+  prepare:
+    name: Resolve and patch upstream
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      upstream_sha: ${{ steps.patch.outputs.upstream_sha }}
+      patched_sha: ${{ steps.patch.outputs.patched_sha }}
+    steps:
+      - name: Check out trusted builder
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Resolve latest stable Bettbox release
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || false }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != 'lovitus/Bettbox-persistent-pin' ]]; then
+            echo "This release workflow is restricted to lovitus/Bettbox-persistent-pin" >&2
+            exit 1
+          fi
+          tag="$(gh api repos/appshubcc/Bettbox/releases/latest --jq .tag_name)"
+          [[ "$tag" == v* ]] || { echo "Unexpected upstream tag: $tag" >&2; exit 1; }
+
+          should_build=true
+          if [[ "$FORCE_REBUILD" != 'true' ]] && gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" >/dev/null 2>&1; then
+            should_build=false
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release is $tag; should_build=$should_build"
+
+      - name: Clone exact upstream release and apply reviewed patches
+        id: patch
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$UPSTREAM_TAG" https://github.com/appshubcc/Bettbox.git source
+          cd source
+          upstream_sha="$(git rev-parse HEAD)"
+          git config user.name 'bettbox-persistent-pin-builder'
+          git config user.email 'actions@users.noreply.github.com'
+
+          git am --3way --directory=core/Clash.Meta ../patches/0001-*.patch
+          git am --3way --directory=core/Clash.Meta ../patches/0002-*.patch
+          git am --3way --directory=core/Clash.Meta ../patches/0003-*.patch
+          git am --3way --directory=core/Clash.Meta ../patches/0004-*.patch
+
+          ../scripts/patch-app-links.sh .
+          git add lib/common/constant.dart lib/views/about.dart
+          git commit -m 'chore(builder): point updates and releases to lovitus builder'
+
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "patched_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go for patch verification
+        if: steps.resolve.outputs.should_build == 'true'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: source/core/Clash.Meta/go.sum
+
+      - name: Verify patch scope and app release links
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.patch.outputs.upstream_sha }}
+        run: scripts/verify-source.sh source "$UPSTREAM_SHA"
+
+      - name: Test the complete patched mihomo tree
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: bash
+        working-directory: source/core/Clash.Meta
+        run: |
+          set -euo pipefail
+          go test -race ./adapter/outboundgroup ./hub/route
+          go test ./...
+
+      - name: Package patched source
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: bash
+        run: tar --exclude='source/.git' -czf source.tgz source
+
+      - name: Upload patched source for the build matrix
+        if: steps.resolve.outputs.should_build == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: patched-source
+          path: source.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}${{ matrix.compatible == true && ' compatible' || '' }}
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            os: ubuntu-24.04
+            arch: arm64
+          - platform: android
+            os: ubuntu-24.04
+            arch: amd64
+          - platform: android
+            os: ubuntu-24.04
+            arch: arm
+          - platform: android
+            os: ubuntu-24.04
+            arch: universal
+          - platform: windows
+            os: windows-2022
+            arch: amd64
+          - platform: windows
+            os: windows-11-arm
+            arch: arm64
+          - platform: windows
+            os: windows-2022
+            arch: amd64
+            compatible: true
+          - platform: macos
+            os: macos-15
+            arch: arm64
+          - platform: macos
+            os: macos-15
+            arch: amd64
+          - platform: macos
+            os: macos-15
+            arch: amd64
+            compatible: true
+          - platform: linux
+            os: ubuntu-22.04
+            arch: amd64
+          - platform: linux
+            os: ubuntu-24.04-arm
+            arch: arm64
+          - platform: linux
+            os: ubuntu-22.04
+            arch: amd64
+            compatible: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - name: Check out trusted builder scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download patched source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: patched-source
+          path: _source
+
+      - name: Extract patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir source
+          tar -xzf _source/source.tgz -C source --strip-components=1
+
+      - name: Enable Git long paths (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - name: Set up Rust (Windows)
+        if: matrix.platform == 'windows'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.arch == 'arm64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc' }}
+
+      - name: Set up Rust (Android)
+        if: matrix.platform == 'android'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Set up Rust (Linux)
+        if: matrix.platform == 'linux'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Set up Rust (macOS)
+        if: matrix.platform == 'macos'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.arch == 'amd64' && 'x86_64-apple-darwin' || 'aarch64-apple-darwin' }}
+
+      - name: Set up Java (Android)
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            source/android/*.gradle*
+            source/android/**/gradle-wrapper.properties
+
+      - name: Set up Android NDK
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk_version='28.2.13676358'
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${ndk_version}" >/dev/null 2>&1 || true
+          echo "ANDROID_NDK=${ANDROID_SDK_ROOT}/ndk/${ndk_version}" >> "$GITHUB_ENV"
+
+      - name: Configure Cargo for Android
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "$cargo_home"
+          cat > "$cargo_home/config.toml" <<EOF
+          [target.aarch64-linux-android]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          [target.armv7-linux-androideabi]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi26-clang"
+          [target.x86_64-linux-android]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android26-clang"
+          [target.i686-linux-android]
+          linker = "${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android26-clang"
+          EOF
+
+      - name: Install Linux packaging dependencies
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::ForceIPv4=true
+          sudo apt-get install -y -o Acquire::Retries=3 -o Acquire::ForceIPv4=true --fix-missing libcurl4-openssl-dev ninja-build libgtk-3-dev rpm
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ matrix.compatible == true && '1.20.x' || '1.25.x' }}
+          cache-dependency-path: source/core/go.sum
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: ${{ contains(matrix.os, 'arm') && 'master' || 'stable' }}
+          cache: true
+          cache-key: flutter-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('source/pubspec.lock') }}
+          flutter-version: ${{ contains(matrix.os, 'arm') && '' || '3.44.9' }}
+
+      - name: Clean Gradle state (Android)
+        if: matrix.platform == 'android'
+        shell: bash
+        working-directory: source/android
+        run: flutter clean
+
+      - name: Disable Swift Package Manager (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        working-directory: source
+        run: flutter config --no-enable-swift-package-manager
+
+      - name: Make the Windows sing-tun module writable
+        if: matrix.platform == 'windows'
+        shell: bash
+        working-directory: source/core
+        run: |
+          set -euo pipefail
+          sing_tun_version="$(grep -E 'github\.com/metacubex/sing-tun[[:space:]]+v[^[:space:]]+' go.mod | awk '{print $2}')"
+          go mod download "github.com/metacubex/sing-tun@${sing_tun_version}"
+          mod_cache="$(cygpath -u "$(go env GOMODCACHE)")"
+          chmod +w "${mod_cache}/github.com/metacubex/sing-tun@${sing_tun_version}/tun_windows.go"
+
+      - name: Build Bettbox (Android, macOS, Linux)
+        if: matrix.platform != 'windows'
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          flutter pub get
+          dart run build_runner build -d
+          dart setup.dart "${{ matrix.platform }}" --arch "${{ matrix.arch }}" --env stable ${{ matrix.compatible == true && '--compatible' || '' }}
+
+      - name: Build Windows core
+        if: matrix.platform == 'windows'
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          flutter pub get
+          dart run build_runner build -d
+          dart setup.dart windows --arch "${{ matrix.arch }}" --out core-only ${{ matrix.compatible == true && '--compatible' || '' }}
+
+      - name: Build Windows helper
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        working-directory: source
+        run: |
+          $coreHash = (Get-FileHash libclash/windows/BettboxCore.exe -Algorithm SHA256).Hash.ToLower()
+          dart setup.dart windows --arch "${{ matrix.arch }}" --out helper --core-hash $coreHash ${{ matrix.compatible == true && '--compatible' || '' }}
+
+      - name: Build Windows application
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        working-directory: source
+        run: |
+          $coreHash = (Get-FileHash libclash/windows/BettboxCore.exe -Algorithm SHA256).Hash.ToLower()
+          $description = if ('${{ matrix.compatible }}' -eq 'true') { "${{ matrix.arch }}-compatible" } else { "${{ matrix.arch }}" }
+          $flutterArgs = @(
+            "build",
+            "windows",
+            "--release",
+            "--verbose",
+            "--dart-define=CORE_SHA256=$coreHash",
+            "--dart-define=APP_ENV=stable",
+            "--dart-define=APP_ASSET_SUFFIX=windows-$description-setup.exe"
+          )
+          flutter @flutterArgs
+
+      - name: Package Windows installer
+        if: matrix.platform == 'windows'
+        shell: bash
+        working-directory: source
+        run: dart windows/packaging/exe/package_windows.dart --arch "${{ matrix.arch }}" ${{ matrix.compatible == true && '--compatible' || '' }} --env stable
+
+      - name: Verify Linux core permissions
+        if: matrix.platform == 'linux' && matrix.compatible != true
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          if compgen -G 'dist/Bettbox-*.deb' >/dev/null; then
+            deb_permissions="$(dpkg-deb -c dist/Bettbox-*.deb | grep BettboxCore || true)"
+            if ! grep -q 'rws' <<< "$deb_permissions"; then
+              control_dir="$(mktemp -d)"
+              dpkg-deb -e dist/Bettbox-*.deb "$control_dir"
+              grep -q '/usr/share/Bettbox/BettboxCore' "$control_dir/postinst"
+            fi
+          fi
+          if compgen -G 'dist/Bettbox-*.rpm' >/dev/null; then
+            rpm_permissions="$(rpm -qplv dist/Bettbox-*.rpm | grep BettboxCore || true)"
+            grep -q 'rws' <<< "$rpm_permissions"
+          fi
+
+      - name: Prepare macOS signing payload
+        if: matrix.platform == 'macos'
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          app='build/macos/Build/Products/Release/Bettbox.app'
+          [[ -d "$app" ]] || { echo 'Bettbox.app was not produced' >&2; exit 1; }
+          dmg_count="$(find dist -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          [[ "$dmg_count" -eq 1 ]] || { echo "Expected one DMG, found $dmg_count" >&2; exit 1; }
+          basename "$(find dist -maxdepth 1 -type f -name '*.dmg' -print -quit)" > macos-dmg-name.txt
+          COPYFILE_DISABLE=1 tar -czf macos-payload.tar.gz \
+            -C build/macos/Build/Products/Release Bettbox.app \
+            -C "$PWD" macos-dmg-name.txt
+
+      - name: Upload raw Android payload
+        if: matrix.platform == 'android'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: raw-Bettbox-android-${{ matrix.arch }}
+          path: source/dist
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload raw macOS payload
+        if: matrix.platform == 'macos'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: raw-Bettbox-macos-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          path: source/macos-payload.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload Windows and Linux artifacts
+        if: matrix.platform == 'windows' || matrix.platform == 'linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Bettbox-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          path: source/dist
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
+
+  sign-android:
+    name: Sign Android APKs
+    needs: [prepare, build]
+    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted signing script
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download raw Android APKs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: raw-Bettbox-android-*
+          path: raw-android
+          merge-multiple: true
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Decode private keystore and sign all APKs
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE }}
+          ANDROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_BASE64:?KEYSTORE secret is required}"
+          keystore="$RUNNER_TEMP/bettbox-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+          scripts/sign-android.sh raw-android signed-android "$keystore"
+          rm -f "$keystore"
+
+      - name: Upload signed Android APKs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Bettbox-android-signed
+          path: signed-android
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  sign-macos:
+    name: Sign and notarize macOS ${{ matrix.arch }}${{ matrix.compatible == true && ' compatible' || '' }}
+    needs: [prepare, build]
+    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+          - arch: amd64
+          - arch: amd64
+            compatible: true
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out trusted signing script
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download raw macOS application
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: raw-Bettbox-macos-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          path: raw-macos
+
+      - name: Sign application, rebuild DMG, notarize, and staple
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: scripts/sign-notarize-macos.sh raw-macos signed-macos
+
+      - name: Upload notarized macOS DMG
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Bettbox-macos-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          path: signed-macos
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Publish complete release
+    needs: [prepare, build, sign-android, sign-macos]
+    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out trusted builder
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download all distributable artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: Bettbox-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download patched source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: patched-source
+          path: source-archive
+
+      - name: Validate the complete upstream platform matrix
+        shell: bash
+        run: scripts/validate-release-assets.sh dist
+
+      - name: Generate source, provenance, release notes, and checksums
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          PATCHED_SHA: ${{ needs.prepare.outputs.patched_sha }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          cp source-archive/source.tgz "dist/Bettbox-${version}-patched-source.tar.gz"
+
+          patch_json="$(for patch in patches/*.patch; do
+            jq -n --arg file "$(basename "$patch")" --arg sha256 "$(sha256sum "$patch" | awk '{print $1}')" '{file: $file, sha256: $sha256}'
+          done | jq -s .)"
+
+          matrix_json='[
+            {"platform":"android","arch":"arm64"},
+            {"platform":"android","arch":"amd64"},
+            {"platform":"android","arch":"arm"},
+            {"platform":"android","arch":"universal"},
+            {"platform":"windows","arch":"amd64"},
+            {"platform":"windows","arch":"arm64"},
+            {"platform":"windows","arch":"amd64","compatible":true},
+            {"platform":"macos","arch":"arm64"},
+            {"platform":"macos","arch":"amd64"},
+            {"platform":"macos","arch":"amd64","compatible":true},
+            {"platform":"linux","arch":"amd64"},
+            {"platform":"linux","arch":"arm64"},
+            {"platform":"linux","arch":"amd64","compatible":true}
+          ]'
+
+          jq -n \
+            --arg generated_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --arg upstream_tag "$RELEASE_TAG" \
+            --arg upstream_sha "$UPSTREAM_SHA" \
+            --arg patched_sha "$PATCHED_SHA" \
+            --arg builder_sha "$GITHUB_SHA" \
+            --argjson patches "$patch_json" \
+            --argjson matrix "$matrix_json" \
+            '{
+              generated_at: $generated_at,
+              upstream: {repository: "appshubcc/Bettbox", tag: $upstream_tag, commit: $upstream_sha},
+              builder: {repository: "lovitus/Bettbox-persistent-pin", commit: $builder_sha, patched_source_commit: $patched_sha},
+              feature: {
+                pull_request: "https://github.com/MetaCubeX/mihomo/pull/2627",
+                original_commits: [
+                  "ca3a4ac8b5b9faa0c7077bac6790e9bbeda4934d",
+                  "c4359c7f0003f14847107a8fbabe186a22897740",
+                  "67a90dd23331591b7e03ba1d36383bb7dbd9f178",
+                  "6b84cc05621547293f28bc751b518f763dc6a2da"
+                ],
+                patches: $patches
+              },
+              signing: {
+                android: "repository-owned keystore",
+                macos: "Developer ID Application, notarized and stapled",
+                windows: "unsigned",
+                linux: "not applicable"
+              },
+              build_matrix: $matrix
+            }' > dist/SOURCE_PROVENANCE.json
+
+          cat > release.md <<EOF
+          This release is built from [appshubcc/Bettbox ${RELEASE_TAG}](https://github.com/appshubcc/Bettbox/releases/tag/${RELEASE_TAG}) and applies **only the complete four-commit series from [mihomo PR #2627](https://github.com/MetaCubeX/mihomo/pull/2627)**, adapted to the mihomo version vendored by Bettbox.
+
+          The application's GitHub link, update check, and automatic asset download all point to this repository.
+
+          ### Platform and signing status
+
+          - Android: arm64-v8a, x86_64, armeabi-v7a, universal — signed with this repository's stable keystore.
+          - Windows: amd64, arm64, amd64-compatible — **unsigned** (no Authenticode certificate is configured).
+          - macOS: Apple Silicon, Intel, Intel-compatible — Developer ID signed, Apple-notarized, and stapled.
+          - Linux: amd64, arm64, amd64-compatible — AppImage/DEB/RPM as emitted by the upstream build.
+
+          Every one of the 13 upstream matrix entries must succeed before this release is published. See SOURCE_PROVENANCE.json and SHA256SUMS for exact inputs and hashes.
+
+          > Android packages use this repository's own signing identity. The first migration from an upstream-signed Bettbox APK may require uninstalling the upstream app first; later releases from this repository upgrade normally.
+          EOF
+
+          (cd dist && sha256sum ./* > SHA256SUMS)
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Bettbox $RELEASE_TAG · persistent pin" --notes-file release.md --latest
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Bettbox $RELEASE_TAG · persistent pin" --notes-file release.md --latest
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+
+      - name: Close an earlier automation failure issue
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue="$(gh issue list --state open --json number,title --jq '.[] | select(.title == "[automation] Bettbox persistent-pin build failed") | .number' | head -n 1)"
+          if [[ -n "$issue" ]]; then
+            gh issue close "$issue" --comment "Recovered in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          fi
+
+  report-failure:
+    name: Report automation failure
+    needs: [prepare, build, sign-android, sign-macos, release]
+    if: >-
+      ${{
+        always() &&
+        (
+          needs.prepare.result == 'failure' ||
+          (
+            needs.prepare.outputs.should_build == 'true' &&
+            (
+              needs.build.result != 'success' ||
+              needs.sign-android.result != 'success' ||
+              needs.sign-macos.result != 'success' ||
+              needs.release.result != 'success'
+            )
+          )
+        )
+      }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create or update one failure issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          ANDROID_SIGN_RESULT: ${{ needs.sign-android.result }}
+          MACOS_SIGN_RESULT: ${{ needs.sign-macos.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          title='[automation] Bettbox persistent-pin build failed'
+          body="$(cat <<EOF
+          The automated full-matrix build did not complete.
+
+          - Upstream tag: ${UPSTREAM_TAG:-unresolved}
+          - Prepare: ${PREPARE_RESULT}
+          - Build matrix: ${BUILD_RESULT}
+          - Android signing: ${ANDROID_SIGN_RESULT}
+          - macOS signing/notarization: ${MACOS_SIGN_RESULT}
+          - Release: ${RELEASE_RESULT}
+          - Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          No partial GitHub Release was published. Resolve the failed job and run the workflow manually with force_rebuild enabled.
+          EOF
+          )"
+          issue="$(gh issue list --state open --json number,title --jq '.[] | select(.title == "[automation] Bettbox persistent-pin build failed") | .number' | head -n 1)"
+          if [[ -n "$issue" ]]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

@@ -1,0 +1,551 @@
+From 414859ab75c3d998cc3dab4aca83cf42ced19f01 Mon Sep 17 00:00:00 2001
+From: fanli <fanli@fanli-m4-16-256.lan>
+Date: Fri, 13 Mar 2026 13:16:40 +0800
+Subject: [PATCH 3/4] feat(group): add auto-unfix threshold for persistent pin
+
+---
+ adapter/outboundgroup/fallback.go | 141 +++++++++++++++++++++++-----
+ adapter/outboundgroup/parser.go   |  56 ++++++-----
+ adapter/outboundgroup/urltest.go  | 151 ++++++++++++++++++++++++------
+ adapter/outboundgroup/util.go     |  20 ++++
+ docs/config.yaml                  |   2 +
+ 5 files changed, 290 insertions(+), 80 deletions(-)
+
+diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.go
+index 8d412f56..bd7a31f3 100644
+--- a/adapter/outboundgroup/fallback.go
++++ b/adapter/outboundgroup/fallback.go
+@@ -19,16 +19,19 @@ type FallbackOption struct{}
+ 
+ type Fallback struct {
+ 	*GroupBase
+-	stateMux        sync.RWMutex
+-	disableUDP      bool
+-	testUrl         string
+-	selected        string
+-	expectedStatus  string
+-	persistentPin   bool
+-	pinWarnInterval time.Duration
+-	lastPinWarnAt   time.Time
+-	lastPinWarnFor  string
+-	lastPinWarnMsg  string
++	stateMux              sync.RWMutex
++	disableUDP            bool
++	testUrl               string
++	selected              string
++	expectedStatus        string
++	persistentPin         bool
++	pinWarnInterval       time.Duration
++	pinAutoUnfixThreshold int
++	pinAutoUnfixCount     int
++	pinAutoUnfixLastTest  time.Time
++	lastPinWarnAt         time.Time
++	lastPinWarnFor        string
++	lastPinWarnMsg        string
+ }
+ 
+ func (f *Fallback) Now() string {
+@@ -92,17 +95,18 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+ 		all = append(all, proxy.Name())
+ 	}
+ 	return json.Marshal(map[string]any{
+-		"type":                    f.Type().String(),
+-		"now":                     f.Now(),
+-		"all":                     all,
+-		"testUrl":                 f.testUrl,
+-		"expectedStatus":          f.expectedStatus,
+-		"fixed":                   f.getSelected(),
+-		"persistentPin":           f.persistentPin,
+-		"pinUnhealthyLogInterval": int(f.pinWarnInterval / time.Second),
+-		"hidden":                  f.Hidden(),
+-		"icon":                    f.Icon(),
+-		"emptyFallback":           f.EmptyFallback().Name(),
++		"type":                            f.Type().String(),
++		"now":                             f.Now(),
++		"all":                             all,
++		"testUrl":                         f.testUrl,
++		"expectedStatus":                  f.expectedStatus,
++		"fixed":                           f.getSelected(),
++		"persistentPin":                   f.persistentPin,
++		"pinUnhealthyLogInterval":         int(f.pinWarnInterval / time.Second),
++		"persistentPinAutoUnfixThreshold": f.pinAutoUnfixThreshold,
++		"hidden":                          f.Hidden(),
++		"icon":                            f.Icon(),
++		"emptyFallback":                   f.EmptyFallback().Name(),
+ 	})
+ }
+ 
+@@ -124,6 +128,9 @@ func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
+ 			}
+ 			foundSelected = true
+ 			if f.persistentPin {
++				if f.observePersistentPinnedResult(selected, proxy, proxies) {
++					break
++				}
+ 				if !proxy.AliveForTestUrl(f.testUrl) {
+ 					f.warnPersistentPinnedProxy(selected, "unhealthy")
+ 				}
+@@ -192,6 +199,7 @@ func (f *Fallback) getSelected() string {
+ func (f *Fallback) setSelected(name string) {
+ 	f.stateMux.Lock()
+ 	f.selected = name
++	f.resetPersistentPinStateLocked()
+ 	f.stateMux.Unlock()
+ }
+ 
+@@ -199,10 +207,86 @@ func (f *Fallback) clearSelectedIf(selected string) {
+ 	f.stateMux.Lock()
+ 	if f.selected == selected {
+ 		f.selected = ""
++		f.resetPersistentPinStateLocked()
+ 	}
+ 	f.stateMux.Unlock()
+ }
+ 
++func (f *Fallback) resetPersistentPinStateLocked() {
++	f.pinAutoUnfixCount = 0
++	f.pinAutoUnfixLastTest = time.Time{}
++	f.lastPinWarnAt = time.Time{}
++	f.lastPinWarnFor = ""
++	f.lastPinWarnMsg = ""
++}
++
++func (f *Fallback) observePersistentPinnedResult(selected string, pinned C.Proxy, proxies []C.Proxy) bool {
++	history, ok := proxyTestHistory(pinned, f.testUrl)
++	if !ok {
++		return false
++	}
++	lastRecord := history[len(history)-1]
++	lastTestAt := lastRecord.Time
++	lastHealthy := lastRecord.Delay != 0
++	hasOtherAlive := false
++	if !lastHealthy {
++		for _, proxy := range proxies {
++			if proxy.Name() == selected {
++				continue
++			}
++			if proxy.AliveForTestUrl(f.testUrl) {
++				hasOtherAlive = true
++				break
++			}
++		}
++	}
++
++	threshold := f.pinAutoUnfixThreshold
++	if threshold <= 0 {
++		threshold = defaultPersistentPinAutoUnfixThreshold
++	}
++
++	autoUnfixed := false
++	reachedCount := 0
++	resetByHealthy := false
++
++	f.stateMux.Lock()
++	if f.selected != selected || !lastTestAt.After(f.pinAutoUnfixLastTest) {
++		f.stateMux.Unlock()
++		return false
++	}
++
++	for _, record := range history {
++		if record.Time.After(f.pinAutoUnfixLastTest) && record.Delay != 0 {
++			resetByHealthy = true
++			break
++		}
++	}
++	f.pinAutoUnfixLastTest = lastTestAt
++	if resetByHealthy {
++		f.pinAutoUnfixCount = 0
++	}
++	if lastHealthy {
++		f.pinAutoUnfixCount = 0
++	} else if hasOtherAlive {
++		f.pinAutoUnfixCount++
++		if f.pinAutoUnfixCount >= threshold {
++			reachedCount = f.pinAutoUnfixCount
++			f.selected = ""
++			f.resetPersistentPinStateLocked()
++			autoUnfixed = true
++		}
++	} else {
++		f.pinAutoUnfixCount = 0
++	}
++	f.stateMux.Unlock()
++
++	if autoUnfixed {
++		log.Warnln("group [%s] auto-unfixed persistent pin on proxy [%s] after %d consecutive unhealthy checks with alternative alive proxies", f.Name(), selected, reachedCount)
++	}
++	return autoUnfixed
++}
++
+ func (f *Fallback) warnPersistentPinnedProxy(selected, reason string) {
+ 	interval := f.pinWarnInterval
+ 	if interval <= 0 {
+@@ -244,6 +328,10 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+ 	if option.PinUnhealthyLogInterval > 0 {
+ 		pinWarnInterval = time.Duration(option.PinUnhealthyLogInterval) * time.Second
+ 	}
++	pinAutoUnfixThreshold := defaultPersistentPinAutoUnfixThreshold
++	if option.PersistentPinAutoUnfixThreshold > 0 {
++		pinAutoUnfixThreshold = option.PersistentPinAutoUnfixThreshold
++	}
+ 
+ 	return &Fallback{
+ 		GroupBase: NewGroupBase(GroupBaseOption{
+@@ -259,10 +347,11 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+ 			EmptyFallback:  emptyFallback,
+ 			Providers:      providers,
+ 		}),
+-		disableUDP:      option.DisableUDP,
+-		testUrl:         option.URL,
+-		expectedStatus:  option.ExpectedStatus,
+-		persistentPin:   option.PersistentPin,
+-		pinWarnInterval: pinWarnInterval,
++		disableUDP:            option.DisableUDP,
++		testUrl:               option.URL,
++		expectedStatus:        option.ExpectedStatus,
++		persistentPin:         option.PersistentPin,
++		pinWarnInterval:       pinWarnInterval,
++		pinAutoUnfixThreshold: pinAutoUnfixThreshold,
+ 	}, nil
+ }
+diff --git a/adapter/outboundgroup/parser.go b/adapter/outboundgroup/parser.go
+index 473e1fb2..de9a5168 100644
+--- a/adapter/outboundgroup/parser.go
++++ b/adapter/outboundgroup/parser.go
+@@ -22,29 +22,35 @@ var (
+ 	errDuplicateProvider = errors.New("duplicate provider name")
+ )
+ 
++const (
++	defaultPinUnhealthyLogIntervalSeconds  = 10
++	defaultPersistentPinAutoUnfixThreshold = 10
++)
++
+ type GroupCommonOption struct {
+-	Name                    string   `group:"name"`
+-	Type                    string   `group:"type"`
+-	Proxies                 []string `group:"proxies,omitempty"`
+-	Use                     []string `group:"use,omitempty"`
+-	URL                     string   `group:"url,omitempty"`
+-	Interval                int      `group:"interval,omitempty"`
+-	TestTimeout             int      `group:"timeout,omitempty"`
+-	MaxFailedTimes          int      `group:"max-failed-times,omitempty"`
+-	EmptyFallback           string   `group:"empty-fallback,omitempty"`
+-	Lazy                    bool     `group:"lazy,omitempty"`
+-	DisableUDP              bool     `group:"disable-udp,omitempty"`
+-	Filter                  string   `group:"filter,omitempty"`
+-	ExcludeFilter           string   `group:"exclude-filter,omitempty"`
+-	ExcludeType             string   `group:"exclude-type,omitempty"`
+-	ExpectedStatus          string   `group:"expected-status,omitempty"`
+-	PersistentPin           bool     `group:"persistent-pin,omitempty"`
+-	PinUnhealthyLogInterval int      `group:"pin-unhealthy-log-interval,omitempty"`
+-	IncludeAll              bool     `group:"include-all,omitempty"`
+-	IncludeAllProxies       bool     `group:"include-all-proxies,omitempty"`
+-	IncludeAllProviders     bool     `group:"include-all-providers,omitempty"`
+-	Hidden                  bool     `group:"hidden,omitempty"`
+-	Icon                    string   `group:"icon,omitempty"`
++	Name                            string   `group:"name"`
++	Type                            string   `group:"type"`
++	Proxies                         []string `group:"proxies,omitempty"`
++	Use                             []string `group:"use,omitempty"`
++	URL                             string   `group:"url,omitempty"`
++	Interval                        int      `group:"interval,omitempty"`
++	TestTimeout                     int      `group:"timeout,omitempty"`
++	MaxFailedTimes                  int      `group:"max-failed-times,omitempty"`
++	EmptyFallback                   string   `group:"empty-fallback,omitempty"`
++	Lazy                            bool     `group:"lazy,omitempty"`
++	DisableUDP                      bool     `group:"disable-udp,omitempty"`
++	Filter                          string   `group:"filter,omitempty"`
++	ExcludeFilter                   string   `group:"exclude-filter,omitempty"`
++	ExcludeType                     string   `group:"exclude-type,omitempty"`
++	ExpectedStatus                  string   `group:"expected-status,omitempty"`
++	PersistentPin                   bool     `group:"persistent-pin,omitempty"`
++	PinUnhealthyLogInterval         int      `group:"pin-unhealthy-log-interval,omitempty"`
++	PersistentPinAutoUnfixThreshold int      `group:"persistent-pin-auto-unfix-threshold,omitempty"`
++	IncludeAll                      bool     `group:"include-all,omitempty"`
++	IncludeAllProxies               bool     `group:"include-all-proxies,omitempty"`
++	IncludeAllProviders             bool     `group:"include-all-providers,omitempty"`
++	Hidden                          bool     `group:"hidden,omitempty"`
++	Icon                            string   `group:"icon,omitempty"`
+ }
+ 
+ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, providersMap map[string]P.ProxyProvider, AllProxies []string, AllProviders []string) (ProxyGroup, error) {
+@@ -74,7 +80,11 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
+ 	groupName := groupOption.Name
+ 	if groupOption.PinUnhealthyLogInterval < 0 {
+ 		log.Warnln("group [%s] has invalid pin-unhealthy-log-interval=%d, fallback to default 10s", groupName, groupOption.PinUnhealthyLogInterval)
+-		groupOption.PinUnhealthyLogInterval = 10
++		groupOption.PinUnhealthyLogInterval = defaultPinUnhealthyLogIntervalSeconds
++	}
++	if _, ok := config["persistent-pin-auto-unfix-threshold"]; ok && groupOption.PersistentPinAutoUnfixThreshold <= 0 {
++		log.Warnln("group [%s] has invalid persistent-pin-auto-unfix-threshold=%d, fallback to default %d", groupName, groupOption.PersistentPinAutoUnfixThreshold, defaultPersistentPinAutoUnfixThreshold)
++		groupOption.PersistentPinAutoUnfixThreshold = defaultPersistentPinAutoUnfixThreshold
+ 	}
+ 
+ 	if groupOption.EmptyFallback == "" {
+diff --git a/adapter/outboundgroup/urltest.go b/adapter/outboundgroup/urltest.go
+index 2e83adca..5a273246 100644
+--- a/adapter/outboundgroup/urltest.go
++++ b/adapter/outboundgroup/urltest.go
+@@ -22,19 +22,22 @@ type URLTestOption struct {
+ 
+ type URLTest struct {
+ 	*GroupBase
+-	stateMux        sync.RWMutex
+-	selected        string
+-	testUrl         string
+-	expectedStatus  string
+-	tolerance       uint16
+-	disableUDP      bool
+-	persistentPin   bool
+-	pinWarnInterval time.Duration
+-	lastPinWarnAt   time.Time
+-	lastPinWarnFor  string
+-	lastPinWarnMsg  string
+-	fastNode        C.Proxy
+-	fastSingle      *singledo.Single[C.Proxy]
++	stateMux              sync.RWMutex
++	selected              string
++	testUrl               string
++	expectedStatus        string
++	tolerance             uint16
++	disableUDP            bool
++	persistentPin         bool
++	pinWarnInterval       time.Duration
++	pinAutoUnfixThreshold int
++	pinAutoUnfixCount     int
++	pinAutoUnfixLastTest  time.Time
++	lastPinWarnAt         time.Time
++	lastPinWarnFor        string
++	lastPinWarnMsg        string
++	fastNode              C.Proxy
++	fastSingle            *singledo.Single[C.Proxy]
+ }
+ 
+ func (u *URLTest) Now() string {
+@@ -119,6 +122,9 @@ func (u *URLTest) fast(touch bool) C.Proxy {
+ 				if proxy.Name() == selected {
+ 					foundSelected = true
+ 					if u.persistentPin {
++						if u.observePersistentPinnedResult(selected, proxy, proxies) {
++							break
++						}
+ 						if !proxy.AliveForTestUrl(u.testUrl) {
+ 							u.warnPersistentPinnedProxy(selected, "unhealthy")
+ 						}
+@@ -205,6 +211,7 @@ func (u *URLTest) setFastNode(proxy C.Proxy) {
+ func (u *URLTest) setSelected(name string) {
+ 	u.stateMux.Lock()
+ 	u.selected = name
++	u.resetPersistentPinStateLocked()
+ 	u.stateMux.Unlock()
+ }
+ 
+@@ -212,6 +219,7 @@ func (u *URLTest) clearSelectedIf(selected string) {
+ 	u.stateMux.Lock()
+ 	if u.selected == selected {
+ 		u.selected = ""
++		u.resetPersistentPinStateLocked()
+ 	}
+ 	u.stateMux.Unlock()
+ }
+@@ -248,6 +256,81 @@ func (u *URLTest) warnPersistentPinnedProxy(selected, reason string) {
+ 	}
+ }
+ 
++func (u *URLTest) resetPersistentPinStateLocked() {
++	u.pinAutoUnfixCount = 0
++	u.pinAutoUnfixLastTest = time.Time{}
++	u.lastPinWarnAt = time.Time{}
++	u.lastPinWarnFor = ""
++	u.lastPinWarnMsg = ""
++}
++
++func (u *URLTest) observePersistentPinnedResult(selected string, pinned C.Proxy, proxies []C.Proxy) bool {
++	history, ok := proxyTestHistory(pinned, u.testUrl)
++	if !ok {
++		return false
++	}
++	lastRecord := history[len(history)-1]
++	lastTestAt := lastRecord.Time
++	lastHealthy := lastRecord.Delay != 0
++	hasOtherAlive := false
++	if !lastHealthy {
++		for _, proxy := range proxies {
++			if proxy.Name() == selected {
++				continue
++			}
++			if proxy.AliveForTestUrl(u.testUrl) {
++				hasOtherAlive = true
++				break
++			}
++		}
++	}
++
++	threshold := u.pinAutoUnfixThreshold
++	if threshold <= 0 {
++		threshold = defaultPersistentPinAutoUnfixThreshold
++	}
++
++	autoUnfixed := false
++	reachedCount := 0
++	resetByHealthy := false
++
++	u.stateMux.Lock()
++	if u.selected != selected || !lastTestAt.After(u.pinAutoUnfixLastTest) {
++		u.stateMux.Unlock()
++		return false
++	}
++
++	for _, record := range history {
++		if record.Time.After(u.pinAutoUnfixLastTest) && record.Delay != 0 {
++			resetByHealthy = true
++			break
++		}
++	}
++	u.pinAutoUnfixLastTest = lastTestAt
++	if resetByHealthy {
++		u.pinAutoUnfixCount = 0
++	}
++	if lastHealthy {
++		u.pinAutoUnfixCount = 0
++	} else if hasOtherAlive {
++		u.pinAutoUnfixCount++
++		if u.pinAutoUnfixCount >= threshold {
++			reachedCount = u.pinAutoUnfixCount
++			u.selected = ""
++			u.resetPersistentPinStateLocked()
++			autoUnfixed = true
++		}
++	} else {
++		u.pinAutoUnfixCount = 0
++	}
++	u.stateMux.Unlock()
++
++	if autoUnfixed {
++		log.Warnln("group [%s] auto-unfixed persistent pin on proxy [%s] after %d consecutive unhealthy checks with alternative alive proxies", u.Name(), selected, reachedCount)
++	}
++	return autoUnfixed
++}
++
+ // SupportUDP implements C.ProxyAdapter
+ func (u *URLTest) SupportUDP() bool {
+ 	if u.disableUDP {
+@@ -268,17 +351,18 @@ func (u *URLTest) MarshalJSON() ([]byte, error) {
+ 		all = append(all, proxy.Name())
+ 	}
+ 	return json.Marshal(map[string]any{
+-		"type":                    u.Type().String(),
+-		"now":                     u.Now(),
+-		"all":                     all,
+-		"testUrl":                 u.testUrl,
+-		"expectedStatus":          u.expectedStatus,
+-		"fixed":                   u.getSelected(),
+-		"persistentPin":           u.persistentPin,
+-		"pinUnhealthyLogInterval": int(u.pinWarnInterval / time.Second),
+-		"hidden":                  u.Hidden(),
+-		"icon":                    u.Icon(),
+-		"emptyFallback":           u.EmptyFallback().Name(),
++		"type":                            u.Type().String(),
++		"now":                             u.Now(),
++		"all":                             all,
++		"testUrl":                         u.testUrl,
++		"expectedStatus":                  u.expectedStatus,
++		"fixed":                           u.getSelected(),
++		"persistentPin":                   u.persistentPin,
++		"pinUnhealthyLogInterval":         int(u.pinWarnInterval / time.Second),
++		"persistentPinAutoUnfixThreshold": u.pinAutoUnfixThreshold,
++		"hidden":                          u.Hidden(),
++		"icon":                            u.Icon(),
++		"emptyFallback":                   u.EmptyFallback().Name(),
+ 	})
+ }
+ 
+@@ -306,6 +390,10 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
+ 	if option.PinUnhealthyLogInterval > 0 {
+ 		pinWarnInterval = time.Duration(option.PinUnhealthyLogInterval) * time.Second
+ 	}
++	pinAutoUnfixThreshold := defaultPersistentPinAutoUnfixThreshold
++	if option.PersistentPinAutoUnfixThreshold > 0 {
++		pinAutoUnfixThreshold = option.PersistentPinAutoUnfixThreshold
++	}
+ 
+ 	urlTest := &URLTest{
+ 		GroupBase: NewGroupBase(GroupBaseOption{
+@@ -321,13 +409,14 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
+ 			EmptyFallback:  emptyFallback,
+ 			Providers:      providers,
+ 		}),
+-		fastSingle:      singledo.NewSingle[C.Proxy](time.Second * 10),
+-		disableUDP:      option.DisableUDP,
+-		testUrl:         option.URL,
+-		expectedStatus:  option.ExpectedStatus,
+-		tolerance:       urlTestOption.Tolerance,
+-		persistentPin:   option.PersistentPin,
+-		pinWarnInterval: pinWarnInterval,
++		fastSingle:            singledo.NewSingle[C.Proxy](time.Second * 10),
++		disableUDP:            option.DisableUDP,
++		testUrl:               option.URL,
++		expectedStatus:        option.ExpectedStatus,
++		tolerance:             urlTestOption.Tolerance,
++		persistentPin:         option.PersistentPin,
++		pinWarnInterval:       pinWarnInterval,
++		pinAutoUnfixThreshold: pinAutoUnfixThreshold,
+ 	}
+ 
+ 	return urlTest, nil
+diff --git a/adapter/outboundgroup/util.go b/adapter/outboundgroup/util.go
+index a1e2a2ab..ad2b5984 100644
+--- a/adapter/outboundgroup/util.go
++++ b/adapter/outboundgroup/util.go
+@@ -2,6 +2,7 @@ package outboundgroup
+ 
+ import (
+ 	"context"
++	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/utils"
+ 	C "github.com/metacubex/mihomo/constant"
+@@ -39,3 +40,22 @@ var _ SelectAble = (*Selector)(nil)
+ type PersistentPinAware interface {
+ 	PersistentPin() bool
+ }
++
++func latestProxyTestTime(proxy C.Proxy, testURL string) (time.Time, bool) {
++	history, ok := proxyTestHistory(proxy, testURL)
++	if !ok || len(history) == 0 {
++		return time.Time{}, false
++	}
++
++	return history[len(history)-1].Time, true
++}
++
++func proxyTestHistory(proxy C.Proxy, testURL string) ([]C.DelayHistory, bool) {
++	extra := proxy.ExtraDelayHistories()
++	state, ok := extra[testURL]
++	if !ok || len(state.History) == 0 {
++		return nil, false
++	}
++
++	return state.History, true
++}
+diff --git a/docs/config.yaml b/docs/config.yaml
+index 5e99160e..f60d0e20 100644
+--- a/docs/config.yaml
++++ b/docs/config.yaml
+@@ -1724,6 +1724,7 @@ proxy-groups:
+     # lazy: true
+     # persistent-pin: false # true 时固定节点将不再被自动测速流程释放
+     # pin-unhealthy-log-interval: 10 # persistent-pin=true 且固定节点异常时，日志提醒间隔（秒）
++    # persistent-pin-auto-unfix-threshold: 10 # persistent-pin=true 时生效，固定节点连续 N 次异常且每次都有其他可用节点时自动解除固定
+     # expected-status: 204 # 当健康检查返回状态码与期望值不符时，认为节点不可用
+     url: "https://cp.cloudflare.com/generate_204"
+     interval: 300
+@@ -1737,6 +1738,7 @@ proxy-groups:
+       - vmess1
+     # persistent-pin: false
+     # pin-unhealthy-log-interval: 10
++    # persistent-pin-auto-unfix-threshold: 10
+     url: "https://cp.cloudflare.com/generate_204"
+     interval: 300
+ 
