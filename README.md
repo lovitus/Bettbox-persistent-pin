@@ -63,7 +63,7 @@ https://github.com/lovitus/Bettbox-persistent-pin
 - Windows：当前没有可用的 Authenticode 证书，安装包明确作为 unsigned 发布。
 - Linux：沿用上游普通 AppImage、DEB 和 RPM 构建，不做代码签名。
 
-所有私钥、密码和 App Store Connect API key 仅保存在 GitHub Actions encrypted repository secrets 中，不存在于 Git、Release、artifact 或日志。上游构建 job 不读取这些 secrets；签名在独立 job 中完成。
+工作流使用的私钥、密码和 App Store Connect API key 副本保存在 GitHub Actions encrypted repository secrets 中；仓库所有者另行保管 Git 外离线备份。任何凭据都不存在于 Git、Release、artifact 或日志。上游构建 job 不读取这些 secrets；签名在独立 job 中完成。
 
 ## Repository secrets
 
