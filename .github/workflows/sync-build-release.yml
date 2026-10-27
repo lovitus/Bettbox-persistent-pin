@@ -10,6 +10,16 @@ on:
         required: false
         type: boolean
         default: true
+      validation_only:
+        description: Build, sign, notarize and validate all artifacts without publishing a Release
+        required: false
+        type: boolean
+        default: false
+      regression_base:
+        description: Optional full builder commit for a one-off old/new comparison (validation_only)
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: bettbox-persistent-pin-release
@@ -28,6 +38,8 @@ jobs:
   prepare:
     name: Resolve and patch upstream
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
       should_build: ${{ steps.resolve.outputs.should_build }}
       tag: ${{ steps.resolve.outputs.tag }}
@@ -43,6 +55,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || false }}
+          VALIDATION_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_only || false }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REPOSITORY" != 'lovitus/Bettbox-persistent-pin' ]]; then
@@ -53,7 +66,7 @@ jobs:
           [[ "$tag" == v* ]] || { echo "Unexpected upstream tag: $tag" >&2; exit 1; }
 
           should_build=true
-          if [[ "$FORCE_REBUILD" != 'true' ]] && gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" >/dev/null 2>&1; then
+          if [[ "$VALIDATION_ONLY" != 'true' && "$FORCE_REBUILD" != 'true' ]] && gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" >/dev/null 2>&1; then
             should_build=false
           fi
 
@@ -94,6 +107,34 @@ jobs:
           go-version: '1.25.x'
           cache-dependency-path: source/core/Clash.Meta/go.sum
 
+      - name: Candidate regression evidence (no change to scheduled release gates)
+        if: github.event_name == 'workflow_dispatch' && inputs.validation_only && steps.resolve.outputs.should_build == 'true'
+        shell: bash
+        env:
+          REGRESSION_BASE: ${{ inputs.regression_base }}
+          UPSTREAM_SHA: ${{ steps.patch.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REGRESSION_BASE" ]]; then
+            [[ "$REGRESSION_BASE" =~ ^[0-9a-f]{40}$ ]] || { echo 'regression_base must be a full commit SHA' >&2; exit 1; }
+            timeout 60 git fetch --no-tags --depth=1 origin "$REGRESSION_BASE"
+            git show "$REGRESSION_BASE:scripts/verify-source.sh" > "$RUNNER_TEMP/baseline-verify-source.sh"
+            git show "$REGRESSION_BASE:scripts/validate-release-assets.sh" > "$RUNNER_TEMP/baseline-assets.sh"
+            set +e
+            bash "$RUNNER_TEMP/baseline-verify-source.sh" source "$UPSTREAM_SHA" > "$RUNNER_TEMP/baseline-source.log" 2>&1
+            source_result=$?
+            ASSET_VALIDATOR="$RUNNER_TEMP/baseline-assets.sh" python3 -m unittest discover -s tests -v > "$RUNNER_TEMP/baseline-assets.log" 2>&1
+            assets_result=$?
+            set -e
+            cat "$RUNNER_TEMP/baseline-source.log" "$RUNNER_TEMP/baseline-assets.log"
+            [[ "$source_result" == 1 && "$assets_result" == 1 ]]
+            grep -Fq 'upstream build matrix changed' "$RUNNER_TEMP/baseline-source.log"
+            grep -Fq 'macos-amd64-compatible.dmg' "$RUNNER_TEMP/baseline-assets.log"
+            echo 'RED: old matrix and artifact gates reject the real upstream contract' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          python3 -m unittest discover -s tests -v
+          echo 'GREEN: candidate artifact contract regression passed; source gate follows' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Verify patch scope and app release links
         if: steps.resolve.outputs.should_build == 'true'
         shell: bash
@@ -127,6 +168,8 @@ jobs:
   build:
     name: Build ${{ matrix.platform }} ${{ matrix.arch }}${{ matrix.compatible == true && ' compatible' || '' }}
     needs: prepare
+    permissions:
+      contents: read
     if: needs.prepare.outputs.should_build == 'true'
     strategy:
       fail-fast: false
@@ -155,15 +198,11 @@ jobs:
             arch: amd64
             compatible: true
           - platform: macos
-            os: macos-15
+            os: macos-26
             arch: arm64
           - platform: macos
-            os: macos-15
+            os: macos-26
             arch: amd64
-          - platform: macos
-            os: macos-15
-            arch: amd64
-            compatible: true
           - platform: linux
             os: ubuntu-22.04
             arch: amd64
@@ -268,8 +307,17 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: ${{ matrix.compatible == true && '1.20.x' || '1.25.x' }}
+          go-version: ${{ matrix.compatible == true && '1.24.x' || '1.25.x' }}
           cache-dependency-path: source/core/go.sum
+
+      - name: Select Xcode 26 (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
 
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
@@ -277,7 +325,11 @@ jobs:
           channel: ${{ contains(matrix.os, 'arm') && 'master' || 'stable' }}
           cache: true
           cache-key: flutter-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('source/pubspec.lock') }}
-          flutter-version: ${{ contains(matrix.os, 'arm') && '' || '3.44.9' }}
+          flutter-version: ${{ contains(matrix.os, 'arm') && '' || '3.47.7' }}
+
+      - name: Clear Pub cache credentials
+        shell: bash
+        run: rm -f "$HOME/.pub-cache/credentials.json"
 
       - name: Clean Gradle state (Android)
         if: matrix.platform == 'android'
@@ -309,7 +361,7 @@ jobs:
         run: |
           set -euo pipefail
           flutter pub get
-          dart run build_runner build -d
+          dart run build_runner build
           dart setup.dart "${{ matrix.platform }}" --arch "${{ matrix.arch }}" --env stable ${{ matrix.compatible == true && '--compatible' || '' }}
 
       - name: Build Windows core
@@ -319,7 +371,7 @@ jobs:
         run: |
           set -euo pipefail
           flutter pub get
-          dart run build_runner build -d
+          dart run build_runner build
           dart setup.dart windows --arch "${{ matrix.arch }}" --out core-only ${{ matrix.compatible == true && '--compatible' || '' }}
 
       - name: Build Windows helper
@@ -354,24 +406,23 @@ jobs:
         working-directory: source
         run: dart windows/packaging/exe/package_windows.dart --arch "${{ matrix.arch }}" ${{ matrix.compatible == true && '--compatible' || '' }} --env stable
 
-      - name: Verify Linux core permissions
-        if: matrix.platform == 'linux' && matrix.compatible != true
+      - name: Demonstrate legacy Linux permission gate failure
+        if: github.event_name == 'workflow_dispatch' && inputs.validation_only && inputs.regression_base != '' && matrix.platform == 'linux' && matrix.arch == 'amd64' && matrix.compatible != true
         shell: bash
-        working-directory: source
         run: |
           set -euo pipefail
-          if compgen -G 'dist/Bettbox-*.deb' >/dev/null; then
-            deb_permissions="$(dpkg-deb -c dist/Bettbox-*.deb | grep BettboxCore || true)"
-            if ! grep -q 'rws' <<< "$deb_permissions"; then
-              control_dir="$(mktemp -d)"
-              dpkg-deb -e dist/Bettbox-*.deb "$control_dir"
-              grep -q '/usr/share/Bettbox/BettboxCore' "$control_dir/postinst"
-            fi
+          rpm_permissions="$(rpm -qplv source/dist/Bettbox-*.rpm | grep BettboxCore)"
+          printf '%s\n' "$rpm_permissions"
+          if grep -q 'rws' <<< "$rpm_permissions"; then
+            echo 'expected the old setuid gate to reject the new capabilities-based package' >&2
+            exit 1
           fi
-          if compgen -G 'dist/Bettbox-*.rpm' >/dev/null; then
-            rpm_permissions="$(rpm -qplv dist/Bettbox-*.rpm | grep BettboxCore || true)"
-            grep -q 'rws' <<< "$rpm_permissions"
-          fi
+          echo 'RED: legacy RPM setuid gate rejects the real upstream package; install verification follows' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify installed Linux core permissions
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: scripts/verify-linux-packages.sh source
 
       - name: Prepare macOS signing payload
         if: matrix.platform == 'macos'
@@ -421,7 +472,9 @@ jobs:
   sign-android:
     name: Sign Android APKs
     needs: [prepare, build]
-    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.should_build == 'true'
+    permissions:
+      contents: read
+    if: needs.prepare.outputs.should_build == 'true' && (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.validation_only))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -461,24 +514,26 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: Bettbox-android-signed
-          path: signed-android
+          # apksigner may also emit .idsig files for incremental installs.
+          # Distribute the four verified APKs, matching the upstream contract.
+          path: signed-android/*.apk
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
 
   sign-macos:
-    name: Sign and notarize macOS ${{ matrix.arch }}${{ matrix.compatible == true && ' compatible' || '' }}
+    name: Sign and notarize macOS ${{ matrix.arch }}
     needs: [prepare, build]
-    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.should_build == 'true'
+    permissions:
+      contents: read
+    if: needs.prepare.outputs.should_build == 'true' && (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.validation_only))
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
           - arch: amd64
-          - arch: amd64
-            compatible: true
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 90
     steps:
       - name: Check out trusted signing script
@@ -487,10 +542,13 @@ jobs:
       - name: Download raw macOS application
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: raw-Bettbox-macos-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          name: raw-Bettbox-macos-${{ matrix.arch }}
           path: raw-macos
 
       - name: Sign application, rebuild DMG, notarize, and staple
+        # notarytool --timeout only bounds polling after upload; bound the
+        # complete operation as well so a stalled upload cannot consume 90m.
+        timeout-minutes: 10
         shell: bash
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
@@ -504,16 +562,16 @@ jobs:
       - name: Upload notarized macOS DMG
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: Bettbox-macos-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          name: Bettbox-macos-${{ matrix.arch }}
           path: signed-macos
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
 
   release:
-    name: Publish complete release
+    name: Validate complete release and optionally publish
     needs: [prepare, build, sign-android, sign-macos]
-    if: github.ref == 'refs/heads/main' && needs.prepare.outputs.should_build == 'true'
+    if: needs.prepare.outputs.should_build == 'true' && (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.validation_only))
     runs-on: ubuntu-24.04
     steps:
       - name: Check out trusted builder
@@ -534,7 +592,9 @@ jobs:
 
       - name: Validate the complete upstream platform matrix
         shell: bash
-        run: scripts/validate-release-assets.sh dist
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: scripts/validate-release-assets.sh dist "$RELEASE_TAG"
 
       - name: Generate source, provenance, release notes, and checksums
         shell: bash
@@ -561,7 +621,6 @@ jobs:
             {"platform":"windows","arch":"amd64","compatible":true},
             {"platform":"macos","arch":"arm64"},
             {"platform":"macos","arch":"amd64"},
-            {"platform":"macos","arch":"amd64","compatible":true},
             {"platform":"linux","arch":"amd64"},
             {"platform":"linux","arch":"arm64"},
             {"platform":"linux","arch":"amd64","compatible":true}
@@ -606,18 +665,31 @@ jobs:
           ### Platform and signing status
 
           - Android: arm64-v8a, x86_64, armeabi-v7a, universal — signed with this repository's stable keystore.
-          - Windows: amd64, arm64, amd64-compatible — **unsigned** (no Authenticode certificate is configured).
-          - macOS: Apple Silicon, Intel, Intel-compatible — Developer ID signed, Apple-notarized, and stapled.
+          - Windows: amd64, arm64, amd64-compatible installers plus amd64-compatible portable ZIP — **unsigned** (no Authenticode certificate is configured).
+          - macOS: Apple Silicon and Intel (macOS 12+) — Developer ID signed, Apple-notarized, and stapled. Upstream no longer produces a separate macOS compatible package.
           - Linux: amd64, arm64, amd64-compatible — AppImage/DEB/RPM as emitted by the upstream build.
 
-          Every one of the 13 upstream matrix entries must succeed before this release is published. See SOURCE_PROVENANCE.json and SHA256SUMS for exact inputs and hashes.
+          Every one of the 12 upstream matrix entries and all signing jobs must succeed before this release is published. The artifact gate requires all 17 version-matched distributables. See SOURCE_PROVENANCE.json and SHA256SUMS for exact inputs and hashes.
 
           > Android packages use this repository's own signing identity. The first migration from an upstream-signed Bettbox APK may require uninstalling the upstream app first; later releases from this repository upgrade normally.
           EOF
 
           (cd dist && sha256sum ./* > SHA256SUMS)
 
+      - name: Save the complete validated candidate
+        if: github.event_name == 'workflow_dispatch' && inputs.validation_only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: validated-release-candidate
+          path: |
+            dist
+            release.md
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
       - name: Create or update GitHub release
+        if: github.ref == 'refs/heads/main' && !inputs.validation_only
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -632,7 +704,7 @@ jobs:
           gh release upload "$RELEASE_TAG" dist/* --clobber
 
       - name: Close an earlier automation failure issue
-        if: success()
+        if: success() && github.ref == 'refs/heads/main' && !inputs.validation_only
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -647,7 +719,7 @@ jobs:
     needs: [prepare, build, sign-android, sign-macos, release]
     if: >-
       ${{
-        always() &&
+        always() && github.ref == 'refs/heads/main' && !inputs.validation_only &&
         (
           needs.prepare.result == 'failure' ||
           (

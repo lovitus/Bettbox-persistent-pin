@@ -146,11 +146,14 @@ codesign --force --timestamp --sign "$MACOS_SIGN_IDENTITY" --keychain "$keychain
 codesign --verify --verbose=2 "$dmg_path"
 
 submission_json="$work_dir/notary-submission.json"
+echo 'Submit signed DMG for notarization using the standard S3 upload endpoint'
 if ! xcrun notarytool submit "$dmg_path" \
   --key "$api_key_file" \
   --key-id "$APP_STORE_CONNECT_KEY_ID" \
   --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+  --no-s3-acceleration \
   --wait \
+  --timeout 10m \
   --output-format json > "$submission_json"; then
   sed -n '1,200p' "$submission_json" >&2
   exit 1
