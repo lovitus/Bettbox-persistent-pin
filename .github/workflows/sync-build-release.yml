@@ -88,6 +88,11 @@ jobs:
           git config user.name 'bettbox-persistent-pin-builder'
           git config user.email 'actions@users.noreply.github.com'
 
+          # Keep the reviewed v1.19.7 base blobs available for git am --3way.
+          # A depth-1 clone of a newer release cannot reconstruct the old files.
+          # Fetch by immutable commit without changing the selected release HEAD.
+          git fetch --no-tags --depth=1 origin 5df714e0d5f133f3a4146dc2b1adfb2311f5f0d0
+
           git am --3way --directory=core/Clash.Meta ../patches/0001-*.patch
           git am --3way --directory=core/Clash.Meta ../patches/0002-*.patch
           git am --3way --directory=core/Clash.Meta ../patches/0003-*.patch
@@ -140,7 +145,10 @@ jobs:
         shell: bash
         env:
           UPSTREAM_SHA: ${{ steps.patch.outputs.upstream_sha }}
-        run: scripts/verify-source.sh source "$UPSTREAM_SHA"
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -v
+          scripts/verify-source.sh source "$UPSTREAM_SHA"
 
       - name: Test the complete patched mihomo tree
         if: steps.resolve.outputs.should_build == 'true'

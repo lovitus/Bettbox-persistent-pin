@@ -95,10 +95,18 @@ for line in text[start:end].splitlines():
             entries.append(current)
         current = {"platform": match.group(1)}
         continue
-    match = re.match(r"\s+(os|arch|compatible):\s*(\S+)\s*$", line)
+    match = re.match(r"\s+(os|arch|compatible|lite):\s*(\S+)\s*$", line)
     if match and current is not None:
         key, value = match.groups()
-        current[key] = value == "true" if key == "compatible" else value
+        if key in current or (key in {"compatible", "lite"} and value not in {"true", "false"}):
+            raise SystemExit(f"invalid or duplicate matrix field: {line!r}")
+        current[key] = value == "true" if key in {"compatible", "lite"} else value
+        continue
+    # Signing metadata does not change the artifact targets built here.
+    if re.fullmatch(r"            sign: (true|false)", line) and current is not None:
+        continue
+    if line.strip() and not line.lstrip().startswith("#"):
+        raise SystemExit(f"unreviewed upstream matrix syntax: {line!r}")
 if current:
     entries.append(current)
 
@@ -117,9 +125,16 @@ expected = [
     {"platform": "linux", "os": "ubuntu-22.04", "arch": "amd64", "compatible": True},
 ]
 
-if entries != expected:
+# v1.19.8 adds a Lite counterpart for every standard target.
+# This builder still publishes standard artifacts; validate both upstream sets
+# explicitly rather than silently ignoring new variants or duplicate targets.
+standard_entries = [entry for entry in entries if "lite" not in entry]
+lite_entries = [entry for entry in entries if "lite" in entry]
+expected_lite = [dict(entry, lite=True) for entry in expected]
+if standard_entries != expected or lite_entries not in ([], expected_lite):
     raise SystemExit(
         "upstream build matrix changed; update and review this builder before publishing\n"
-        f"expected={expected!r}\nactual={entries!r}"
+        f"expected_standard={expected!r}\nactual_standard={standard_entries!r}\n"
+        f"expected_lite={expected_lite!r}\nactual_lite={lite_entries!r}"
     )
 PY
