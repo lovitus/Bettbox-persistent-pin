@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-payload_dir="${1:?usage: sign-notarize-macos.sh PAYLOAD_DIR OUTPUT_DIR}"
-output_dir="${2:?usage: sign-notarize-macos.sh PAYLOAD_DIR OUTPUT_DIR}"
+usage='usage: sign-notarize-macos.sh PAYLOAD_DIR OUTPUT_DIR EXPECTED_DMG_NAME'
+payload_dir="${1:?$usage}"
+output_dir="${2:?$usage}"
+dmg_name="${3:?$usage}"
+[[ "$dmg_name" =~ ^Bettbox-[0-9]+\.[0-9]+\.[0-9]+-macos-(arm64|amd64)(-standard)?\.dmg$ ]] || {
+  echo "invalid expected DMG name: $dmg_name" >&2; exit 1;
+}
 
 : "${MACOS_CERTIFICATE_P12:?MACOS_CERTIFICATE_P12 is required}"
 : "${MACOS_CERTIFICATE_PASSWORD:?MACOS_CERTIFICATE_PASSWORD is required}"
@@ -67,9 +72,9 @@ app_count="$(find "$extract_dir" -type d -name 'Bettbox.app' -prune -print | wc 
 app="$(find "$extract_dir" -type d -name 'Bettbox.app' -prune -print -quit)"
 
 name_file="$extract_dir/macos-dmg-name.txt"
-[[ -s "$name_file" ]] || { echo "macos-dmg-name.txt is missing" >&2; exit 1; }
-dmg_name="$(tr -d '\r\n' < "$name_file")"
-[[ "$dmg_name" == Bettbox-*.dmg ]] || { echo "unexpected DMG name: ${dmg_name}" >&2; exit 1; }
+[[ -f "$name_file" && ! -L "$name_file" ]] && printf '%s\n' "$dmg_name" | cmp -s - "$name_file" || {
+  echo "payload DMG name does not match the expected $dmg_name" >&2; exit 1;
+}
 
 sign_macho_files() {
   local root="$1"

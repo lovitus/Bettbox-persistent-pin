@@ -70,9 +70,17 @@ if [[ -n "$unformatted" ]]; then
   exit 1
 fi
 
-python3 - <<'PY'
+python3 - "$(git rev-parse --verify "${upstream_commit}^{commit}")" <<'PY'
 from pathlib import Path
 import re
+import sys
+
+# Only these reviewed releases may use the older artifact layouts.
+legacy_variants = {
+    "5df714e0d5f133f3a4146dc2b1adfb2311f5f0d0": None,  # v1.19.7
+    "88b9597ad88f597e61a2843ad6fe33d5bdee8950": "lite",  # v1.19.8
+}
+variant = legacy_variants.get(sys.argv[1], "standard")
 
 workflow = Path(".github/workflows/build.yaml")
 if not workflow.is_file():
@@ -89,21 +97,22 @@ except ValueError as exc:
 entries = []
 current = None
 for line in text[start:end].splitlines():
-    match = re.match(r"\s+- platform:\s*(\S+)\s*$", line)
+    match = re.fullmatch(r"          - platform: (\S+)", line)
     if match:
         if current:
             entries.append(current)
         current = {"platform": match.group(1)}
         continue
-    match = re.match(r"\s+(os|arch|compatible|lite):\s*(\S+)\s*$", line)
+    match = re.fullmatch(r"            (os|arch|compatible|lite|standard|sign): (\S+)", line)
     if match and current is not None:
         key, value = match.groups()
-        if key in current or (key in {"compatible", "lite"} and value not in {"true", "false"}):
-            raise SystemExit(f"invalid or duplicate matrix field: {line!r}")
-        current[key] = value == "true" if key in {"compatible", "lite"} else value
-        continue
-    # Signing metadata does not change the artifact targets built here.
-    if re.fullmatch(r"            sign: (true|false)", line) and current is not None:
+        if key in current:
+            raise SystemExit(f"duplicate matrix field: {line!r}")
+        if key in {"compatible", "lite", "standard", "sign"}:
+            if value not in {"true", "false"}:
+                raise SystemExit(f"invalid boolean matrix field: {line!r}")
+            value = value == "true"
+        current[key] = value
         continue
     if line.strip() and not line.lstrip().startswith("#"):
         raise SystemExit(f"unreviewed upstream matrix syntax: {line!r}")
@@ -125,16 +134,38 @@ expected = [
     {"platform": "linux", "os": "ubuntu-22.04", "arch": "amd64", "compatible": True},
 ]
 
-# v1.19.8 adds a Lite counterpart for every standard target.
-# This builder still publishes standard artifacts; validate both upstream sets
-# explicitly rather than silently ignoring new variants or duplicate targets.
-standard_entries = [entry for entry in entries if "lite" not in entry]
-lite_entries = [entry for entry in entries if "lite" in entry]
-expected_lite = [dict(entry, lite=True) for entry in expected]
-if standard_entries != expected or lite_entries not in ([], expected_lite):
+for entry in entries:
+    entry.pop("sign", None)  # Signing metadata does not change the artifact target.
+plain = [entry for entry in entries if "lite" not in entry and "standard" not in entry]
+marked = [entry for entry in entries if "lite" in entry or "standard" in entry]
+expected_marked = [dict(entry, **{variant: True}) for entry in expected] if variant else []
+if plain != expected or marked != expected_marked:
     raise SystemExit(
         "upstream build matrix changed; update and review this builder before publishing\n"
-        f"expected_standard={expected!r}\nactual_standard={standard_entries!r}\n"
-        f"expected_lite={expected_lite!r}\nactual_lite={lite_entries!r}"
+        f"expected_plain={expected!r}\nactual_plain={plain!r}\n"
+        f"expected_marked={expected_marked!r}\nactual_marked={marked!r}"
     )
+
+if variant == "standard":
+    # Only the plain Windows amd64-compatible job produces and uploads a ZIP.
+    portable_upload = """      - name: Upload Windows Portable Artifact
+        if: matrix.platform == 'windows' && matrix.compatible == true && matrix.arch == 'amd64' && matrix.standard != true
+        uses: actions/upload-artifact@v7
+        with:
+          name: Bettbox-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}-portable
+          path: ./dist/*.zip
+          archive: false
+          overwrite: true"""
+    build_steps = text[end:].split("\n  upload:", 1)[0]
+    steps = re.split(r"(?=^      - name: )", build_steps, flags=re.MULTILINE)
+    if sum(step.rstrip() == portable_upload for step in steps) != 1:
+        raise SystemExit("upstream Windows portable upload step changed")
+    packager = Path("windows/packaging/exe/package_windows.dart").read_text(encoding="utf-8")
+    for marker in (
+        "  final makePortable =\n      (args['portable'] as bool?) ??\n      (compatible && arch == 'amd64' && !standard);",
+        "  if (makePortable) {",
+        "    final portableOutputBaseName =\n        'Bettbox-$appVersion-windows-$desc-portable.zip';",
+    ):
+        if f"\n{marker}\n" not in packager:
+            raise SystemExit(f"upstream Windows portable packaging marker changed: {marker}")
 PY

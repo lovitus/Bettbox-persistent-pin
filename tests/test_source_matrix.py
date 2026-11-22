@@ -5,7 +5,29 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/verify-source.sh"
-CODE = SCRIPT.read_text().split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+CODE = SCRIPT.read_text().split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+V197 = "5df714e0d5f133f3a4146dc2b1adfb2311f5f0d0"
+V198 = "88b9597ad88f597e61a2843ad6fe33d5bdee8950"
+V199 = "1f5318f7938baeef5fe4c0c3e3db14154f931d1e"
+PORTABLE_UPLOAD = """      - name: Upload Windows Portable Artifact
+        if: matrix.platform == 'windows' && matrix.compatible == true && matrix.arch == 'amd64' && matrix.standard != true
+        uses: actions/upload-artifact@v7
+        with:
+          name: Bettbox-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}-portable
+          path: ./dist/*.zip
+          archive: false
+          overwrite: true
+"""
+PACKAGER = """void main() {
+  final makePortable =
+      (args['portable'] as bool?) ??
+      (compatible && arch == 'amd64' && !standard);
+  if (makePortable) {
+    final portableOutputBaseName =
+        'Bettbox-$appVersion-windows-$desc-portable.zip';
+  }
+}
+"""
 TARGETS = [
     ("android", "ubuntu-24.04", arch, False)
     for arch in ("arm64", "amd64", "arm", "universal")
@@ -21,47 +43,70 @@ TARGETS = [
 ]
 
 
-def matrix(include_lite):
+def matrix(*variants):
     text = "jobs:\n  build:\n    strategy:\n      matrix:\n        include:\n"
     for platform in ("android", "windows", "macos", "linux"):
-        for lite in ([False, True] if include_lite else [False]):
+        for variant in variants:
             for name, os_name, arch, compatible in TARGETS:
                 if name != platform:
                     continue
                 text += f"          - platform: {name}\n            os: {os_name}\n            arch: {arch}\n"
                 if compatible:
                     text += "            compatible: true\n"
-                if lite:
-                    text += "            lite: true\n"
-    return text + "\n    steps:\n      - run: echo build\n"
+                if variant:
+                    text += f"            {variant}: true\n"
+    return text + "\n    steps:\n" + PORTABLE_UPLOAD
 
 
 class SourceMatrix(unittest.TestCase):
+    def check_gate(self, workflow, accepted, commit=V199, packager=PACKAGER):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / ".github/workflows/build.yaml"
+            target.parent.mkdir(parents=True)
+            target.write_text(workflow)
+            package = Path(root) / "windows/packaging/exe/package_windows.dart"
+            package.parent.mkdir(parents=True)
+            package.write_text(packager)
+            result = subprocess.run(
+                ["python3", "-c", CODE, commit], cwd=root,
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_versioned_matrices(self):
+        layouts = [(None,), (None, "lite"), (None, "standard")]
+        for commit, expected in zip([V197, V198, V199], layouts):
+            for layout in layouts:
+                with self.subTest(commit=commit, layout=layout):
+                    self.check_gate(matrix(*layout), layout == expected, commit)
+
     def test_supported_and_unreviewed_matrices(self):
-        current = matrix(True)
+        current = matrix(None, "standard")
         cases = [
-            ("standard only", matrix(False), True),
-            ("standard and Lite", current, True),
+            ("missing plain variant", matrix("standard"), False),
+            ("duplicate complete variant", matrix(None, "standard", "standard"), False),
+            ("unexpected third variant", matrix(None, "standard", "lite"), False),
             ("signing metadata", current.replace("            arch: amd64\n", "            arch: amd64\n            sign: true\n", 1), True),
             ("reordered extra target", current.replace("\n    steps:", "          - arch: amd64\n            platform: linux\n            os: ubuntu-22.04\n            compatible: true\n            lite: true\n\n    steps:"), False),
             ("unknown field", current.replace("            arch: arm64\n", "            arch: arm64\n            variant: other\n", 1), False),
             ("duplicate field", current.replace("            arch: arm64\n", "            arch: arm64\n            arch: arm64\n", 1), False),
             ("unknown architecture", current.replace("arch: arm64", "arch: riscv64", 1), False),
-            ("missing Lite marker", current.replace("            lite: true\n", "", 1), False),
-            ("false Lite marker", current.replace("lite: true", "lite: false", 1), False),
+            ("missing Standard marker", current.replace("            standard: true\n", "", 1), False),
+            ("false Standard marker", current.replace("standard: true", "standard: false", 1), False),
             ("changed runner", current.replace("os: macos-26", "os: macos-27", 1), False),
         ]
-        with tempfile.TemporaryDirectory() as root:
-            target = Path(root) / ".github/workflows/build.yaml"
-            target.parent.mkdir(parents=True)
-            for label, text, accepted in cases:
-                with self.subTest(label=label):
-                    target.write_text(text)
-                    result = subprocess.run(
-                        ["python3", "-c", CODE], cwd=root,
-                        capture_output=True, text=True, timeout=15,
-                    )
-                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+        for label, text, accepted in cases:
+            with self.subTest(label=label):
+                self.check_gate(text, accepted)
+
+    def test_portable_contract(self):
+        current = matrix(None, "standard")
+        for marker in [PORTABLE_UPLOAD, " && matrix.standard != true", "-portable", "./dist/*.zip"]:
+            with self.subTest(upload_marker=marker):
+                self.check_gate(current.replace(marker, ""), False)
+        for marker in [" && !standard", "if (makePortable)", "-portable.zip"]:
+            with self.subTest(package_marker=marker):
+                self.check_gate(current, False, packager=PACKAGER.replace(marker, ""))
 
 
 if __name__ == "__main__":

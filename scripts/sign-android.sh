@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-input_dir="${1:?usage: sign-android.sh INPUT_DIR OUTPUT_DIR KEYSTORE}"
-output_dir="${2:?usage: sign-android.sh INPUT_DIR OUTPUT_DIR KEYSTORE}"
-keystore="${3:?usage: sign-android.sh INPUT_DIR OUTPUT_DIR KEYSTORE}"
+usage='usage: sign-android.sh INPUT_DIR OUTPUT_DIR KEYSTORE RELEASE_TAG'
+input_dir="${1:?$usage}"
+output_dir="${2:?$usage}"
+keystore="${3:?$usage}"
+release_tag="${4:?$usage}"
+[[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'invalid stable release tag' >&2; exit 1; }
 
 : "${ANDROID_KEY_ALIAS:?ANDROID_KEY_ALIAS is required}"
 : "${ANDROID_STORE_PASSWORD:?ANDROID_STORE_PASSWORD is required}"
@@ -21,22 +24,26 @@ mkdir -p "$output_dir"
 work_dir="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/bettbox-android-sign.XXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT
 
-patterns=(
-  '*-android-arm64-v8a.apk'
-  '*-android-x86_64.apk'
-  '*-android-armeabi-v7a.apk'
-  '*-android-universal.apk'
-)
+# Keep artifact subdirectories separate so duplicate names cannot be overwritten
+# during download. Validate the entire input set before using the signing key.
+shopt -s globstar nullglob dotglob
+apks=("$input_dir"/**/*.apk)
+[[ ${#apks[@]} == 8 ]] || { echo "expected eight input APKs, found ${#apks[@]}" >&2; exit 1; }
+inputs=()
+for edition in '' '-standard'; do
+  for abi in arm64-v8a x86_64 armeabi-v7a universal; do
+    filename="Bettbox-${release_tag#v}-android$edition-$abi.apk"
+    matches=("$input_dir"/**/"$filename")
+    if [[ ${#matches[@]} != 1 || ! -f "${matches[0]:-}" || -L "${matches[0]:-}" || ! -s "${matches[0]:-}" ]]; then
+      echo "expected exactly one nonempty regular input: $filename" >&2
+      exit 1
+    fi
+    inputs+=("${matches[0]}")
+  done
+done
 
-for pattern in "${patterns[@]}"; do
-  mapfile -t matches < <(find "$input_dir" -type f -name "$pattern" -print)
-  if [[ "${#matches[@]}" -ne 1 ]]; then
-    echo "expected exactly one input matching ${pattern}, found ${#matches[@]}" >&2
-    exit 1
-  fi
-
-  input="${matches[0]}"
-  filename="$(basename "$input")"
+for input in "${inputs[@]}"; do
+  filename="${input##*/}"
   aligned="$work_dir/$filename"
   output="$output_dir/$filename"
 
@@ -52,5 +59,5 @@ for pattern in "${patterns[@]}"; do
   "$zipalign" -c -v 4 "$output" >/dev/null
 done
 
-output_count="$(find "$output_dir" -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')"
-[[ "$output_count" == 4 ]] || { echo "expected four signed APKs, found ${output_count}" >&2; exit 1; }
+outputs=("$output_dir"/*.apk)
+[[ ${#outputs[@]} == 8 ]] || { echo "expected eight signed APKs, found ${#outputs[@]}" >&2; exit 1; }

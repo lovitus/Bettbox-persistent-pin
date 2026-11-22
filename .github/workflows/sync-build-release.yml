@@ -63,7 +63,7 @@ jobs:
             exit 1
           fi
           tag="$(gh api repos/appshubcc/Bettbox/releases/latest --jq .tag_name)"
-          [[ "$tag" == v* ]] || { echo "Unexpected upstream tag: $tag" >&2; exit 1; }
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected upstream tag: $tag" >&2; exit 1; }
 
           should_build=true
           if [[ "$VALIDATION_ONLY" != 'true' && "$FORCE_REBUILD" != 'true' ]] && gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" >/dev/null 2>&1; then
@@ -112,33 +112,23 @@ jobs:
           go-version: '1.25.x'
           cache-dependency-path: source/core/Clash.Meta/go.sum
 
-      - name: Candidate regression evidence (no change to scheduled release gates)
-        if: github.event_name == 'workflow_dispatch' && inputs.validation_only && steps.resolve.outputs.should_build == 'true'
+      - name: Verify that the old builder rejects the new upstream matrix
+        if: github.event_name == 'workflow_dispatch' && inputs.validation_only && inputs.regression_base != '' && steps.resolve.outputs.should_build == 'true'
         shell: bash
         env:
           REGRESSION_BASE: ${{ inputs.regression_base }}
           UPSTREAM_SHA: ${{ steps.patch.outputs.upstream_sha }}
         run: |
           set -euo pipefail
-          if [[ -n "$REGRESSION_BASE" ]]; then
-            [[ "$REGRESSION_BASE" =~ ^[0-9a-f]{40}$ ]] || { echo 'regression_base must be a full commit SHA' >&2; exit 1; }
-            timeout 60 git fetch --no-tags --depth=1 origin "$REGRESSION_BASE"
-            git show "$REGRESSION_BASE:scripts/verify-source.sh" > "$RUNNER_TEMP/baseline-verify-source.sh"
-            git show "$REGRESSION_BASE:scripts/validate-release-assets.sh" > "$RUNNER_TEMP/baseline-assets.sh"
-            set +e
-            bash "$RUNNER_TEMP/baseline-verify-source.sh" source "$UPSTREAM_SHA" > "$RUNNER_TEMP/baseline-source.log" 2>&1
-            source_result=$?
-            ASSET_VALIDATOR="$RUNNER_TEMP/baseline-assets.sh" python3 -m unittest discover -s tests -v > "$RUNNER_TEMP/baseline-assets.log" 2>&1
-            assets_result=$?
-            set -e
-            cat "$RUNNER_TEMP/baseline-source.log" "$RUNNER_TEMP/baseline-assets.log"
-            [[ "$source_result" == 1 && "$assets_result" == 1 ]]
-            grep -Fq 'upstream build matrix changed' "$RUNNER_TEMP/baseline-source.log"
-            grep -Fq 'macos-amd64-compatible.dmg' "$RUNNER_TEMP/baseline-assets.log"
-            echo 'RED: old matrix and artifact gates reject the real upstream contract' >> "$GITHUB_STEP_SUMMARY"
-          fi
-          python3 -m unittest discover -s tests -v
-          echo 'GREEN: candidate artifact contract regression passed; source gate follows' >> "$GITHUB_STEP_SUMMARY"
+          [[ "$REGRESSION_BASE" =~ ^[0-9a-f]{40}$ ]] || { echo 'regression_base must be a full commit SHA' >&2; exit 1; }
+          timeout 60 git fetch --no-tags --depth=1 origin "$REGRESSION_BASE"
+          git show "$REGRESSION_BASE:scripts/verify-source.sh" > "$RUNNER_TEMP/baseline-source.sh"
+          result=0
+          bash "$RUNNER_TEMP/baseline-source.sh" source "$UPSTREAM_SHA" > "$RUNNER_TEMP/baseline-source.log" 2>&1 || result=$?
+          cat "$RUNNER_TEMP/baseline-source.log"
+          [[ "$result" == 1 ]]
+          grep -Eq 'unreviewed upstream matrix syntax:.*standard: true|upstream build matrix changed' "$RUNNER_TEMP/baseline-source.log"
+          echo 'Old builder rejected the upstream matrix; checking the candidate below.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify patch scope and app release links
         if: steps.resolve.outputs.should_build == 'true'
@@ -174,7 +164,7 @@ jobs:
           retention-days: 7
 
   build:
-    name: Build ${{ matrix.platform }} ${{ matrix.arch }}${{ matrix.compatible == true && ' compatible' || '' }}
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}${{ matrix.compatible == true && ' compatible' || '' }} ${{ matrix.standard == true && 'Standard' || 'slim' }}
     needs: prepare
     permissions:
       contents: read
@@ -195,6 +185,22 @@ jobs:
           - platform: android
             os: ubuntu-24.04
             arch: universal
+          - platform: android
+            os: ubuntu-24.04
+            arch: arm64
+            standard: true
+          - platform: android
+            os: ubuntu-24.04
+            arch: amd64
+            standard: true
+          - platform: android
+            os: ubuntu-24.04
+            arch: arm
+            standard: true
+          - platform: android
+            os: ubuntu-24.04
+            arch: universal
+            standard: true
           - platform: windows
             os: windows-2022
             arch: amd64
@@ -205,12 +211,33 @@ jobs:
             os: windows-2022
             arch: amd64
             compatible: true
+          - platform: windows
+            os: windows-2022
+            arch: amd64
+            standard: true
+          - platform: windows
+            os: windows-11-arm
+            arch: arm64
+            standard: true
+          - platform: windows
+            os: windows-2022
+            arch: amd64
+            compatible: true
+            standard: true
           - platform: macos
             os: macos-26
             arch: arm64
           - platform: macos
             os: macos-26
             arch: amd64
+          - platform: macos
+            os: macos-26
+            arch: arm64
+            standard: true
+          - platform: macos
+            os: macos-26
+            arch: amd64
+            standard: true
           - platform: linux
             os: ubuntu-22.04
             arch: amd64
@@ -221,6 +248,19 @@ jobs:
             os: ubuntu-22.04
             arch: amd64
             compatible: true
+          - platform: linux
+            os: ubuntu-22.04
+            arch: amd64
+            standard: true
+          - platform: linux
+            os: ubuntu-24.04-arm
+            arch: arm64
+            standard: true
+          - platform: linux
+            os: ubuntu-22.04
+            arch: amd64
+            compatible: true
+            standard: true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
@@ -272,7 +312,7 @@ jobs:
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
           cache: gradle
           cache-dependency-path: |
             source/android/*.gradle*
@@ -332,8 +372,8 @@ jobs:
         with:
           channel: ${{ contains(matrix.os, 'arm') && 'master' || 'stable' }}
           cache: true
-          cache-key: flutter-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('source/pubspec.lock') }}
-          flutter-version: ${{ contains(matrix.os, 'arm') && '' || '3.47.7' }}
+          cache-key: flutter-:channel:-:version:-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('source/pubspec.lock') }}
+          flutter-version: ${{ !contains(matrix.os, 'arm') && '3.50.1' || '' }}
 
       - name: Clear Pub cache credentials
         shell: bash
@@ -351,7 +391,7 @@ jobs:
         working-directory: source
         run: flutter config --no-enable-swift-package-manager
 
-      - name: Make the Windows sing-tun module writable
+      - name: Disable sing-tun interface forwarding on Windows
         if: matrix.platform == 'windows'
         shell: bash
         working-directory: source/core
@@ -360,17 +400,23 @@ jobs:
           sing_tun_version="$(grep -E 'github\.com/metacubex/sing-tun[[:space:]]+v[^[:space:]]+' go.mod | awk '{print $2}')"
           go mod download "github.com/metacubex/sing-tun@${sing_tun_version}"
           mod_cache="$(cygpath -u "$(go env GOMODCACHE)")"
-          chmod +w "${mod_cache}/github.com/metacubex/sing-tun@${sing_tun_version}/tun_windows.go"
+          tun_file="${mod_cache}/github.com/metacubex/sing-tun@${sing_tun_version}/tun_windows.go"
+          chmod +w "$tun_file"
+          perl -pi -e 's/inetIf\.ForwardingEnabled = true/inetIf.ForwardingEnabled = false/g' "$tun_file"
+          grep -Fq 'inetIf.ForwardingEnabled = false' "$tun_file"
 
       - name: Build Bettbox (Android, macOS, Linux)
         if: matrix.platform != 'windows'
         shell: bash
         working-directory: source
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
         run: |
           set -euo pipefail
           flutter pub get
           dart run build_runner build
-          dart setup.dart "${{ matrix.platform }}" --arch "${{ matrix.arch }}" --env stable ${{ matrix.compatible == true && '--compatible' || '' }}
+          dart setup.dart "${{ matrix.platform }}" --arch "${{ matrix.arch }}" --env stable ${{ matrix.compatible == true && '--compatible' || '' }} ${{ matrix.standard == true && '--standard' || '' }}
 
       - name: Build Windows core
         if: matrix.platform == 'windows'
@@ -380,7 +426,7 @@ jobs:
           set -euo pipefail
           flutter pub get
           dart run build_runner build
-          dart setup.dart windows --arch "${{ matrix.arch }}" --out core-only ${{ matrix.compatible == true && '--compatible' || '' }}
+          dart setup.dart windows --arch "${{ matrix.arch }}" --out core-only ${{ matrix.compatible == true && '--compatible' || '' }} ${{ matrix.standard == true && '--standard' || '' }}
 
       - name: Build Windows helper
         if: matrix.platform == 'windows'
@@ -388,15 +434,21 @@ jobs:
         working-directory: source
         run: |
           $coreHash = (Get-FileHash libclash/windows/BettboxCore.exe -Algorithm SHA256).Hash.ToLower()
-          dart setup.dart windows --arch "${{ matrix.arch }}" --out helper --core-hash $coreHash ${{ matrix.compatible == true && '--compatible' || '' }}
+          dart setup.dart windows --arch "${{ matrix.arch }}" --out helper --core-hash $coreHash ${{ matrix.compatible == true && '--compatible' || '' }} ${{ matrix.standard == true && '--standard' || '' }}
 
       - name: Build Windows application
         if: matrix.platform == 'windows'
         shell: pwsh
         working-directory: source
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN || vars.IPINFO_TOKEN }}
         run: |
           $coreHash = (Get-FileHash libclash/windows/BettboxCore.exe -Algorithm SHA256).Hash.ToLower()
-          $description = if ('${{ matrix.compatible }}' -eq 'true') { "${{ matrix.arch }}-compatible" } else { "${{ matrix.arch }}" }
+          $parts = @('${{ matrix.arch }}')
+          if ('${{ matrix.compatible }}' -eq 'true') { $parts += 'compatible' }
+          if ('${{ matrix.standard }}' -eq 'true') { $parts += 'standard' }
+          $description = $parts -join '-'
           $flutterArgs = @(
             "build",
             "windows",
@@ -406,26 +458,16 @@ jobs:
             "--dart-define=APP_ENV=stable",
             "--dart-define=APP_ASSET_SUFFIX=windows-$description-setup.exe"
           )
+          if ('${{ matrix.standard }}' -eq 'true') { $flutterArgs += '--dart-define=APP_STANDARD=true' }
+          if ($env:SENTRY_DSN) { $flutterArgs += "--dart-define=SENTRY_DSN=$env:SENTRY_DSN" }
+          if ($env:IPINFO_TOKEN) { $flutterArgs += "--dart-define=IPINFO_TOKEN=$env:IPINFO_TOKEN" }
           flutter @flutterArgs
 
       - name: Package Windows installer
         if: matrix.platform == 'windows'
         shell: bash
         working-directory: source
-        run: dart windows/packaging/exe/package_windows.dart --arch "${{ matrix.arch }}" ${{ matrix.compatible == true && '--compatible' || '' }} --env stable
-
-      - name: Demonstrate legacy Linux permission gate failure
-        if: github.event_name == 'workflow_dispatch' && inputs.validation_only && inputs.regression_base != '' && matrix.platform == 'linux' && matrix.arch == 'amd64' && matrix.compatible != true
-        shell: bash
-        run: |
-          set -euo pipefail
-          rpm_permissions="$(rpm -qplv source/dist/Bettbox-*.rpm | grep BettboxCore)"
-          printf '%s\n' "$rpm_permissions"
-          if grep -q 'rws' <<< "$rpm_permissions"; then
-            echo 'expected the old setuid gate to reject the new capabilities-based package' >&2
-            exit 1
-          fi
-          echo 'RED: legacy RPM setuid gate rejects the real upstream package; install verification follows' >> "$GITHUB_STEP_SUMMARY"
+        run: dart windows/packaging/exe/package_windows.dart --arch "${{ matrix.arch }}" ${{ matrix.compatible == true && '--compatible' || '' }} ${{ matrix.standard == true && '--standard' || '' }} --env stable
 
       - name: Verify installed Linux core permissions
         if: matrix.platform == 'linux'
@@ -451,7 +493,7 @@ jobs:
         if: matrix.platform == 'android'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: raw-Bettbox-android-${{ matrix.arch }}
+          name: raw-Bettbox-android-${{ matrix.arch }}${{ matrix.standard == true && '-standard' || '' }}
           path: source/dist
           if-no-files-found: error
           retention-days: 3
@@ -461,7 +503,7 @@ jobs:
         if: matrix.platform == 'macos'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: raw-Bettbox-macos-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          name: raw-Bettbox-macos-${{ matrix.arch }}${{ matrix.standard == true && '-standard' || '' }}
           path: source/macos-payload.tar.gz
           if-no-files-found: error
           retention-days: 3
@@ -471,7 +513,7 @@ jobs:
         if: matrix.platform == 'windows' || matrix.platform == 'linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: Bettbox-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}
+          name: Bettbox-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}${{ matrix.standard == true && '-standard' || '' }}
           path: source/dist
           if-no-files-found: error
           retention-days: 7
@@ -494,17 +536,18 @@ jobs:
         with:
           pattern: raw-Bettbox-android-*
           path: raw-android
-          merge-multiple: true
+          merge-multiple: false
 
       - name: Set up Java
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - name: Decode private keystore and sign all APKs
         shell: bash
         env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE }}
           ANDROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           ANDROID_STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
@@ -513,24 +556,25 @@ jobs:
           set -euo pipefail
           : "${KEYSTORE_BASE64:?KEYSTORE secret is required}"
           keystore="$RUNNER_TEMP/bettbox-release.jks"
+          trap 'rm -f "$keystore"' EXIT
+          umask 077
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
           chmod 600 "$keystore"
-          scripts/sign-android.sh raw-android signed-android "$keystore"
-          rm -f "$keystore"
+          scripts/sign-android.sh raw-android signed-android "$keystore" "$RELEASE_TAG"
 
       - name: Upload signed Android APKs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: Bettbox-android-signed
           # apksigner may also emit .idsig files for incremental installs.
-          # Distribute the four verified APKs, matching the upstream contract.
+          # Distribute the eight verified APKs, matching the upstream contract.
           path: signed-android/*.apk
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
 
   sign-macos:
-    name: Sign and notarize macOS ${{ matrix.arch }}
+    name: Sign and notarize macOS ${{ matrix.arch }} ${{ matrix.standard == true && 'Standard' || 'slim' }}
     needs: [prepare, build]
     permissions:
       contents: read
@@ -538,9 +582,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: arm64
-          - arch: amd64
+        arch: [arm64, amd64]
+        standard: [false, true]
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -550,7 +593,7 @@ jobs:
       - name: Download raw macOS application
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: raw-Bettbox-macos-${{ matrix.arch }}
+          name: raw-Bettbox-macos-${{ matrix.arch }}${{ matrix.standard == true && '-standard' || '' }}
           path: raw-macos
 
       - name: Sign application, rebuild DMG, notarize, and staple
@@ -559,18 +602,20 @@ jobs:
         timeout-minutes: 10
         shell: bash
         env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          DMG_SUFFIX: macos-${{ matrix.arch }}${{ matrix.standard == true && '-standard' || '' }}.dmg
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
           APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-        run: scripts/sign-notarize-macos.sh raw-macos signed-macos
+        run: scripts/sign-notarize-macos.sh raw-macos signed-macos "Bettbox-${RELEASE_TAG#v}-$DMG_SUFFIX"
 
       - name: Upload notarized macOS DMG
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: Bettbox-macos-${{ matrix.arch }}
+          name: Bettbox-macos-${{ matrix.arch }}${{ matrix.standard == true && '-standard' || '' }}
           path: signed-macos
           if-no-files-found: error
           retention-days: 7
@@ -589,14 +634,48 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: Bettbox-*
-          path: dist
-          merge-multiple: true
+          path: release-artifacts
+          merge-multiple: false
+
+      - name: Collect final packages and reject duplicate filenames
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob dotglob
+          mkdir dist
+          for artifact in release-artifacts/*; do
+            for file in "$artifact"/*; do
+              name="${file##*/}"
+              [[ -f "$file" && ! -L "$file" && ! -e "dist/$name" ]] || {
+                echo "Unexpected or duplicate release entry: $file" >&2
+                exit 1
+              }
+              mv -- "$file" "dist/$name"
+            done
+          done
 
       - name: Download patched source
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: patched-source
           path: source-archive
+
+      - name: Verify that the old builder rejects the complete dual-variant release
+        if: github.event_name == 'workflow_dispatch' && inputs.validation_only && inputs.regression_base != ''
+        shell: bash
+        env:
+          REGRESSION_BASE: ${{ inputs.regression_base }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          timeout 60 git fetch --no-tags --depth=1 origin "$REGRESSION_BASE"
+          git show "$REGRESSION_BASE:scripts/validate-release-assets.sh" > "$RUNNER_TEMP/baseline-assets.sh"
+          result=0
+          bash "$RUNNER_TEMP/baseline-assets.sh" dist "$RELEASE_TAG" > "$RUNNER_TEMP/baseline-assets.log" 2>&1 || result=$?
+          cat "$RUNNER_TEMP/baseline-assets.log"
+          [[ "$result" == 1 ]]
+          grep -Fxq "+Bettbox-${RELEASE_TAG#v}-android-standard-arm64-v8a.apk" "$RUNNER_TEMP/baseline-assets.log"
+          echo 'Old builder rejected the Standard APK in the actual release set.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validate the complete upstream platform matrix
         shell: bash
@@ -613,6 +692,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
+          # AppUpdater requires bare filenames. Hash only the validated downloads,
+          # including the final signed APKs and notarized, stapled DMGs.
+          (cd dist && sha256sum Bettbox-* > sha256sums.txt)
           cp source-archive/source.tgz "dist/Bettbox-${version}-patched-source.tar.gz"
 
           patch_json="$(for patch in patches/*.patch; do
@@ -641,7 +723,7 @@ jobs:
             --arg patched_sha "$PATCHED_SHA" \
             --arg builder_sha "$GITHUB_SHA" \
             --argjson patches "$patch_json" \
-            --argjson matrix "$matrix_json" \
+            --argjson matrix "$(jq -c '[.[] | . + {standard:false}, . + {standard:true}]' <<< "$matrix_json")" \
             '{
               generated_at: $generated_at,
               upstream: {repository: "appshubcc/Bettbox", tag: $upstream_tag, commit: $upstream_sha},
@@ -672,17 +754,29 @@ jobs:
 
           ### Platform and signing status
 
-          - Android: arm64-v8a, x86_64, armeabi-v7a, universal — signed with this repository's stable keystore.
-          - Windows: amd64, arm64, amd64-compatible installers plus amd64-compatible portable ZIP — **unsigned** (no Authenticode certificate is configured).
-          - macOS: Apple Silicon and Intel (macOS 12+) — Developer ID signed, Apple-notarized, and stapled. Upstream no longer produces a separate macOS compatible package.
-          - Linux: amd64, arm64, amd64-compatible — AppImage/DEB/RPM as emitted by the upstream build.
+          The default (slim) edition uses filenames without an edition marker. To use EasyTier, Tailscale, ZeroTier, fake-tcp or gVisor, choose a file with the standard marker. An in-app update from v1.19.8 that requests an unmarked filename installs the slim edition; select a Standard download manually to keep those features.
 
-          Every one of the 12 upstream matrix entries and all signing jobs must succeed before this release is published. The artifact gate requires all 17 version-matched distributables. See SOURCE_PROVENANCE.json and SHA256SUMS for exact inputs and hashes.
+          - Android: eight APKs covering arm64-v8a, x86_64, armeabi-v7a and universal for both editions, signed with this repository's stable keystore.
+          - Windows: six unsigned installers (amd64, arm64 and amd64-compatible in each edition) and one unsigned slim amd64-compatible portable ZIP.
+          - macOS: four DMGs for Apple Silicon and Intel (macOS 12+) across both editions, Developer ID signed, Apple-notarized and stapled.
+          - Linux: fourteen packages across both editions. Each supplies AppImage, DEB and RPM for amd64 and amd64-compatible, plus a DEB for arm64.
+
+          All 24 upstream matrix entries and the signing jobs must succeed before publication. The artifact gate requires all 33 version-matched distributables. The in-app updater uses sha256sums.txt to check downloads. SHA256SUMS also covers that manifest, the patched source archive and SOURCE_PROVENANCE.json.
 
           > Android packages use this repository's own signing identity. The first migration from an upstream-signed Bettbox APK may require uninstalling the upstream app first; later releases from this repository upgrade normally.
           EOF
 
           (cd dist && sha256sum ./* > SHA256SUMS)
+
+      - name: Verify updater and full release checksums
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          [[ "$(wc -l < sha256sums.txt)" -eq 33 ]]
+          [[ "$(wc -l < SHA256SUMS)" -eq 36 ]]
+          sha256sum --check --strict sha256sums.txt
+          sha256sum --check --strict SHA256SUMS
 
       - name: Save the complete validated candidate
         if: github.event_name == 'workflow_dispatch' && inputs.validation_only
