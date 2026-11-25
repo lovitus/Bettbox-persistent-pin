@@ -780,11 +780,11 @@ jobs:
           The default (slim) edition uses filenames without an edition marker. To use EasyTier, Tailscale, ZeroTier, fake-tcp or gVisor, choose a file with the standard marker. An in-app update from v1.19.8 that requests an unmarked filename installs the slim edition; select a Standard download manually to keep those features.
 
           - Android: eight APKs covering arm64-v8a, x86_64, armeabi-v7a and universal for both editions, signed with this repository's stable keystore.
-          - Windows: six unsigned installers (amd64, arm64 and amd64-compatible in each edition) and one unsigned slim amd64-compatible portable ZIP.
+          - Windows: six unsigned installers (amd64, arm64 and amd64-compatible in each edition) and two unsigned slim portable ZIPs (amd64 and amd64-compatible).
           - macOS: four DMGs for Apple Silicon and Intel (macOS 12+) across both editions, Developer ID signed, Apple-notarized and stapled.
           - Linux: fourteen packages across both editions. Each supplies AppImage, DEB and RPM for amd64 and amd64-compatible, plus a DEB for arm64.
 
-          All 24 upstream matrix entries and the signing jobs must succeed before publication. The artifact gate requires all 33 version-matched distributables. The in-app updater uses sha256sums.txt to check downloads. SHA256SUMS also covers that manifest, the patched source archive and SOURCE_PROVENANCE.json.
+          All 24 upstream matrix entries and the signing jobs must succeed before publication. The artifact gate requires all 34 version-matched distributables. The in-app updater uses sha256sums.txt to check downloads. SHA256SUMS also covers that manifest, the patched source archive and SOURCE_PROVENANCE.json.
 
           > Android packages use this repository's own signing identity. The first migration from an upstream-signed Bettbox APK may require uninstalling the upstream app first; later releases from this repository upgrade normally.
           EOF
@@ -796,8 +796,8 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          [[ "$(wc -l < sha256sums.txt)" -eq 33 ]]
-          [[ "$(wc -l < SHA256SUMS)" -eq 36 ]]
+          [[ "$(wc -l < sha256sums.txt)" -eq 34 ]]
+          [[ "$(wc -l < SHA256SUMS)" -eq 37 ]]
           sha256sum --check --strict sha256sums.txt
           sha256sum --check --strict SHA256SUMS
 
