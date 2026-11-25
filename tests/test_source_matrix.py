@@ -8,9 +8,9 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts/verify-source.sh"
 CODE = SCRIPT.read_text().split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
 V197 = "5df714e0d5f133f3a4146dc2b1adfb2311f5f0d0"
 V198 = "88b9597ad88f597e61a2843ad6fe33d5bdee8950"
-V199 = "1f5318f7938baeef5fe4c0c3e3db14154f931d1e"
+V1201 = "bd94edb933e0b87c968d91bc4cb2f2043999a061"
 PORTABLE_UPLOAD = """      - name: Upload Windows Portable Artifact
-        if: matrix.platform == 'windows' && matrix.compatible == true && matrix.arch == 'amd64' && matrix.standard != true
+        if: matrix.platform == 'windows' && matrix.arch == 'amd64' && matrix.standard != true
         uses: actions/upload-artifact@v7
         with:
           name: Bettbox-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}-portable
@@ -20,8 +20,7 @@ PORTABLE_UPLOAD = """      - name: Upload Windows Portable Artifact
 """
 PACKAGER = """void main() {
   final makePortable =
-      (args['portable'] as bool?) ??
-      (compatible && arch == 'amd64' && !standard);
+      (args['portable'] as bool?) ?? (arch == 'amd64' && !standard);
   if (makePortable) {
     final portableOutputBaseName =
         'Bettbox-$appVersion-windows-$desc-portable.zip';
@@ -59,7 +58,7 @@ def matrix(*variants):
 
 
 class SourceMatrix(unittest.TestCase):
-    def check_gate(self, workflow, accepted, commit=V199, packager=PACKAGER):
+    def check_gate(self, workflow, accepted, commit=V1201, packager=PACKAGER):
         with tempfile.TemporaryDirectory() as root:
             target = Path(root) / ".github/workflows/build.yaml"
             target.parent.mkdir(parents=True)
@@ -75,7 +74,7 @@ class SourceMatrix(unittest.TestCase):
 
     def test_versioned_matrices(self):
         layouts = [(None,), (None, "lite"), (None, "standard")]
-        for commit, expected in zip([V197, V198, V199], layouts):
+        for commit, expected in zip([V197, V198, V1201], layouts):
             for layout in layouts:
                 with self.subTest(commit=commit, layout=layout):
                     self.check_gate(matrix(*layout), layout == expected, commit)
@@ -104,6 +103,10 @@ class SourceMatrix(unittest.TestCase):
         for marker in [PORTABLE_UPLOAD, " && matrix.standard != true", "-portable", "./dist/*.zip"]:
             with self.subTest(upload_marker=marker):
                 self.check_gate(current.replace(marker, ""), False)
+        # Restoring the old compatible-only rule would silently lose the new ZIP.
+        self.check_gate(current.replace(" && matrix.arch", " && matrix.compatible == true && matrix.arch", 1), False)
+        self.check_gate(current, False, packager=PACKAGER.replace("(arch ==", "(compatible && arch ==", 1))
+        self.check_gate(current + PORTABLE_UPLOAD, False)
         for marker in [" && !standard", "if (makePortable)", "-portable.zip"]:
             with self.subTest(package_marker=marker):
                 self.check_gate(current, False, packager=PACKAGER.replace(marker, ""))

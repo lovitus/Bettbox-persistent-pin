@@ -1,4 +1,4 @@
-"""Behavioral contract for the v1.19.9 release set; run on GitHub-hosted Linux."""
+"""Behavioral contract for the v1.20.1 release set; run on GitHub-hosted Linux."""
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +11,7 @@ SUFFIXES = (
     "android-universal.apk", "android-x86_64.apk",
     "windows-amd64-setup.exe", "windows-arm64-setup.exe",
     "windows-amd64-compatible-setup.exe", "windows-amd64-compatible-portable.zip",
+    "windows-amd64-portable.zip",
     "macos-arm64.dmg", "macos-amd64.dmg",
     "linux-amd64.AppImage", "linux-amd64.deb", "linux-amd64.rpm",
     "linux-arm64.deb", "linux-amd64-compatible.AppImage",
@@ -37,11 +38,13 @@ class ReleaseAssets(unittest.TestCase):
         cases += [("missing", suffix) for suffix in SUFFIXES]
         cases += [("empty", SUFFIXES[0]), ("symlink", SUFFIXES[0])]
         cases += [("extra", name) for name in (
-            "Bettbox-1.19.9-macos-amd64-compatible.dmg",
+            "Bettbox-1.20.1-macos-amd64-compatible.dmg",
             "Bettbox-1.19.4-macos-arm64.dmg",
-            "Bettbox-1.19.9-windows-amd64-compatible-standard-portable.zip",
-            "Bettbox-1.19.9-android-arm64-v8a-standard.apk",
-            "Bettbox-1.19.9-linux-amd64-standard-compatible.rpm",
+            "Bettbox-1.20.1-windows-amd64-compatible-standard-portable.zip",
+            "Bettbox-1.20.1-windows-amd64-standard-portable.zip",
+            "Bettbox-1.20.1-windows-arm64-portable.zip",
+            "Bettbox-1.20.1-android-arm64-v8a-standard.apk",
+            "Bettbox-1.20.1-linux-amd64-standard-compatible.rpm",
             "raw-macos-payload.tar.gz", "unexpected\nasset", ".unexpected",
         )]
         cases += [("wrong_version", None)]
@@ -49,18 +52,18 @@ class ReleaseAssets(unittest.TestCase):
             with self.subTest(operation=operation, value=value), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 for suffix in SUFFIXES:
-                    (root / f"Bettbox-1.19.9-{suffix}").write_bytes(b"artifact fixture\n")
+                    (root / f"Bettbox-1.20.1-{suffix}").write_bytes(b"artifact fixture\n")
                 if operation in ("missing", "empty", "symlink"):
-                    target = root / f"Bettbox-1.19.9-{value}"
+                    target = root / f"Bettbox-1.20.1-{value}"
                     if operation == "empty":
                         target.write_bytes(b"")
                     else:
                         target.unlink()
                         if operation == "symlink":
-                            target.symlink_to(root / "Bettbox-1.19.9-macos-arm64.dmg")
+                            target.symlink_to(root / "Bettbox-1.20.1-macos-arm64.dmg")
                 elif operation == "extra":
                     (root / value).write_bytes(b"unreviewed artifact\n")
-                version = "v1.19.4" if operation == "wrong_version" else "v1.19.9"
+                version = "v1.19.4" if operation == "wrong_version" else "v1.20.1"
                 result = subprocess.run(
                     ["bash", str(VALIDATOR), str(root), version],
                     capture_output=True, text=True, timeout=15,
@@ -93,7 +96,7 @@ class AndroidSigning(unittest.TestCase):
             keystore = root / "test.jks"
             keystore.touch()
             raw, output, log = root / "raw", root / "signed", root / "verified"
-            names = [f"Bettbox-1.19.9-{s}" for s in SUFFIXES if s.endswith(".apk")]
+            names = [f"Bettbox-1.20.1-{s}" for s in SUFFIXES if s.endswith(".apk")]
             for i, name in enumerate(names):
                 artifact = raw / str(i)
                 artifact.mkdir(parents=True)
@@ -101,7 +104,7 @@ class AndroidSigning(unittest.TestCase):
             env = dict(os.environ, ANDROID_SDK_ROOT=directory, RUNNER_TEMP=directory,
                        ANDROID_KEY_ALIAS="test", ANDROID_STORE_PASSWORD="test",
                        ANDROID_KEY_PASSWORD="test", VERIFY_LOG=str(log))
-            args = ["bash", str(script), str(raw), str(output), str(keystore), "v1.19.9"]
+            args = ["bash", str(script), str(raw), str(output), str(keystore), "v1.20.1"]
             target = raw / "0" / names[0]
             duplicate = raw / "0" / names[-1]
             target.rename(duplicate)

@@ -7,7 +7,7 @@ release_tag="${2:?usage: validate-release-assets.sh DIST_DIR RELEASE_TAG}"
 version="${release_tag#v}"
 
 prefix="Bettbox-$version"
-expected=("$prefix-windows-amd64-compatible-portable.zip")
+expected=("$prefix-windows-amd64-portable.zip" "$prefix-windows-amd64-compatible-portable.zip")
 for edition in '' '-standard'; do
   for abi in arm64-v8a x86_64 armeabi-v7a universal; do
     expected+=("$prefix-android$edition-$abi.apk")

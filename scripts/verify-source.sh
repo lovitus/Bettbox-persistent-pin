@@ -147,9 +147,9 @@ if plain != expected or marked != expected_marked:
     )
 
 if variant == "standard":
-    # Only the plain Windows amd64-compatible job produces and uploads a ZIP.
+    # Both plain Windows amd64 jobs (normal and compatible) produce a ZIP.
     portable_upload = """      - name: Upload Windows Portable Artifact
-        if: matrix.platform == 'windows' && matrix.compatible == true && matrix.arch == 'amd64' && matrix.standard != true
+        if: matrix.platform == 'windows' && matrix.arch == 'amd64' && matrix.standard != true
         uses: actions/upload-artifact@v7
         with:
           name: Bettbox-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.compatible == true && '-compatible' || '' }}-portable
@@ -162,7 +162,7 @@ if variant == "standard":
         raise SystemExit("upstream Windows portable upload step changed")
     packager = Path("windows/packaging/exe/package_windows.dart").read_text(encoding="utf-8")
     for marker in (
-        "  final makePortable =\n      (args['portable'] as bool?) ??\n      (compatible && arch == 'amd64' && !standard);",
+        "  final makePortable =\n      (args['portable'] as bool?) ?? (arch == 'amd64' && !standard);",
         "  if (makePortable) {",
         "    final portableOutputBaseName =\n        'Bettbox-$appVersion-windows-$desc-portable.zip';",
     ):

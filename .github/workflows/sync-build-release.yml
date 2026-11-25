@@ -368,12 +368,35 @@ jobs:
           xcodebuild -version
 
       - name: Set up Flutter
+        if: ${{ !contains(matrix.os, 'arm') }}
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
-          channel: ${{ contains(matrix.os, 'arm') && 'master' || 'stable' }}
+          channel: stable
           cache: true
           cache-key: flutter-:channel:-:version:-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('source/pubspec.lock') }}
-          flutter-version: ${{ !contains(matrix.os, 'arm') && '3.50.1' || '' }}
+          flutter-version: '3.47.9'
+
+      - name: Set up Flutter (ARM)
+        if: ${{ contains(matrix.os, 'arm') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter_dir="$RUNNER_TEMP/flutter"
+          pub_cache_dir="$HOME/.pub-cache"
+          git clone --depth 1 --branch 3.47.9 https://github.com/flutter/flutter.git "$flutter_dir"
+          mkdir -p "$pub_cache_dir/bin"
+          if command -v cygpath >/dev/null 2>&1; then
+            echo "FLUTTER_ROOT=$(cygpath -w "$flutter_dir")" >> "$GITHUB_ENV"
+            echo "PUB_CACHE=$(cygpath -w "$pub_cache_dir")" >> "$GITHUB_ENV"
+            for directory in "$flutter_dir/bin" "$flutter_dir/bin/cache/dart-sdk/bin" "$pub_cache_dir/bin"; do
+              cygpath -w "$directory" >> "$GITHUB_PATH"
+            done
+          else
+            echo "FLUTTER_ROOT=$flutter_dir" >> "$GITHUB_ENV"
+            echo "PUB_CACHE=$pub_cache_dir" >> "$GITHUB_ENV"
+            printf '%s\n' "$flutter_dir/bin" "$flutter_dir/bin/cache/dart-sdk/bin" "$pub_cache_dir/bin" >> "$GITHUB_PATH"
+          fi
+          "$flutter_dir/bin/flutter" --version
 
       - name: Clear Pub cache credentials
         shell: bash
